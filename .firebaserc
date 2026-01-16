@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "ocr-system-c3bea"
+  },
+  "targets": {
+    "ocr-system-c3bea": {
+      "hosting": {
+        "v2": [
+          "v2-ocr-system-c3bea"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

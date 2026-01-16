@@ -1,0 +1,31 @@
+{
+  "name": "functions",
+  "description": "Cloud Functions for Firebase",
+  "scripts": {
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/storage": "^7.0.0",
+    "@google-cloud/vision": "^4.0.0",
+    "@google/generative-ai": "^0.21.0",
+    "@napi-rs/canvas": "^0.1.88",
+    "canvas": "^3.2.0",
+    "cors": "^2.8.5",
+    "dommatrix": "^0.1.1",
+    "firebase-admin": "^13.6.0",
+    "firebase-functions": "^7.0.0",
+    "pdfjs-dist": "^4.4.168"
+  },
+  "devDependencies": {
+    "firebase-functions-test": "^3.4.1"
+  },
+  "private": true
+}
