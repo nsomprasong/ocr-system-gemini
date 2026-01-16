@@ -16,21 +16,42 @@ function normalizeText(text) {
     return "";
   }
   
-  // Remove excessive whitespace (keep single spaces and newlines)
+  // Step 1: Normalize line endings
   let normalized = text
-    .replace(/\r\n/g, "\n") // Normalize line endings
-    .replace(/\r/g, "\n") // Normalize line endings
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  
+  // Step 2: Fix fragmented OCR text - merge single-character lines with next line
+  // This helps when OCR splits words across lines
+  const lines = normalized.split("\n");
+  const mergedLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const nextLine = i < lines.length - 1 ? lines[i + 1].trim() : "";
+    
+    // If current line is a single character (not space, not empty) and next line exists
+    if (line.length === 1 && line.match(/[^\s]/) && nextLine.length > 0) {
+      // Merge with next line (no space if it's likely part of a word)
+      mergedLines.push(line + nextLine);
+      i++; // Skip next line as it's merged
+    } else if (line.length > 0) {
+      mergedLines.push(line);
+    }
+  }
+  normalized = mergedLines.join("\n");
+  
+  // Step 3: Remove excessive whitespace
+  normalized = normalized
     .replace(/[ \t]+/g, " ") // Multiple spaces/tabs → single space
     .replace(/\n{3,}/g, "\n\n") // Multiple newlines → double newline
     .trim();
   
-  // Remove zero-width characters and other invisible chars
+  // Step 4: Remove zero-width characters and other invisible chars
   normalized = normalized.replace(/[\u200B-\u200D\uFEFF]/g, "");
   
-  // Normalize Thai characters (common OCR errors)
-  // Note: Only fix obvious errors, don't over-correct
+  // Step 5: Normalize Thai characters (common OCR errors)
   normalized = normalized
-    .replace(/๐/g, "0") // Thai zero → Arabic zero
+    .replace(/๐/g, "0")
     .replace(/๑/g, "1")
     .replace(/๒/g, "2")
     .replace(/๓/g, "3")

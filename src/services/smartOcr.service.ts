@@ -72,16 +72,40 @@ export async function smartOcrPdf(
       hasColumnDefinitions: !!requestBody.columnDefinitions && requestBody.columnDefinitions.length > 0,
     })
     
-    const response = await fetch(FIREBASE_SMART_OCR_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(requestBody),
-    }).catch((fetchError) => {
-      console.error(`❌ [Smart OCR] Fetch error:`, fetchError);
+    // เพิ่ม timeout 8 นาที (480 วินาที) เพื่อให้พอดีกับ backend timeout (540 วินาที)
+    const TIMEOUT_MS = 8 * 60 * 1000; // 8 minutes
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, TIMEOUT_MS);
+    
+    const startTime = Date.now();
+    console.log(`⏱️ [Smart OCR] Starting request with ${TIMEOUT_MS / 1000}s timeout...`);
+    console.log(`⏳ [Smart OCR] Waiting for backend response (this may take 3-8 minutes)...`);
+    
+    let response: Response;
+    try {
+      response = await fetch(FIREBASE_SMART_OCR_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      console.log(`✅ [Smart OCR] Request completed in ${duration}s`);
+    } catch (fetchError: any) {
+      clearTimeout(timeoutId);
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      if (fetchError.name === 'AbortError') {
+        console.error(`❌ [Smart OCR] Request timeout after ${duration}s`);
+        throw new Error(`Smart OCR request timeout: เกิน ${TIMEOUT_MS / 1000} วินาที. กรุณาลองใหม่อีกครั้ง`);
+      }
+      console.error(`❌ [Smart OCR] Fetch error after ${duration}s:`, fetchError);
       throw new Error(`Failed to connect to Smart OCR service: ${fetchError.message}`);
-    });
+    }
 
     console.log(`📡 [Smart OCR] Response status: ${response.status}`)
     

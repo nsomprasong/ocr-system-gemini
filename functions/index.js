@@ -1676,6 +1676,8 @@ async function smartOcrPdf(pdfBase64, fileName = "input.pdf", columnDefinitions 
     } else {
       // STEP 2b: Use OCR (Google Vision)
       console.log(`📄 [Smart OCR] Step 2b: No text layer found, using OCR...`);
+      console.log(`⏱️ [Smart OCR] OCR step may take 1-3 minutes depending on PDF size...`);
+      const ocrStartTime = Date.now();
       const ocrResult = await ocrPdfBase64Gemini(
         pdfBase64,
         fileName,
@@ -1745,7 +1747,8 @@ async function smartOcrPdf(pdfBase64, fileName = "input.pdf", columnDefinitions 
         pages = 1;
       }
       source = "vision";
-      console.log(`✅ [Smart OCR] OCR extracted ${extractedText.length} characters from ${pages} page(s)`);
+      const ocrDuration = ((Date.now() - ocrStartTime) / 1000).toFixed(2);
+      console.log(`✅ [Smart OCR] OCR extracted ${extractedText.length} characters from ${pages} page(s) in ${ocrDuration}s`);
     }
     
     if (!extractedText || extractedText.trim().length === 0) {
@@ -1795,11 +1798,15 @@ async function smartOcrPdf(pdfBase64, fileName = "input.pdf", columnDefinitions 
     
     // STEP 4: Gemini Pass #1 - Analyze document structure (ONLY if pre-validation passed)
     console.log(`🤖 [Smart OCR] Step 4: Gemini Pass #1 - Analyzing document structure via REST API...`);
+    const pass1StartTime = Date.now();
     let structureAnalysis;
     try {
       structureAnalysis = await analyzeDocumentStructure(normalizedText, null); // apiKey not used (uses secret)
+      const pass1Duration = ((Date.now() - pass1StartTime) / 1000).toFixed(2);
+      console.log(`✅ [Smart OCR] Step 4 completed in ${pass1Duration}s`);
     } catch (geminiError) {
-      console.error(`❌ [Smart OCR] Gemini Pass #1 failed:`, geminiError);
+      const pass1Duration = ((Date.now() - pass1StartTime) / 1000).toFixed(2);
+      console.error(`❌ [Smart OCR] Gemini Pass #1 failed after ${pass1Duration}s:`, geminiError);
       // Fallback: Use basic structure
       structureAnalysis = {
         documentType: "บัญชีรายชื่อ",
@@ -1814,15 +1821,20 @@ async function smartOcrPdf(pdfBase64, fileName = "input.pdf", columnDefinitions 
     
     // STEP 5: Gemini Pass #2 - Convert to JSON table (ONLY if pre-validation passed)
     console.log(`🤖 [Smart OCR] Step 5: Gemini Pass #2 - Converting to JSON table...`);
+    console.log(`⏱️ [Smart OCR] This step may take 2-5 minutes depending on document size...`);
+    const pass2StartTime = Date.now();
     let jsonTable = [];
     let confidence = "low";
     
     if (columnDefinitions && columnDefinitions.length > 0) {
       try {
         jsonTable = await convertToJsonTable(normalizedText, structureAnalysis, columnDefinitions, null);
+        const pass2Duration = ((Date.now() - pass2StartTime) / 1000).toFixed(2);
+        console.log(`✅ [Smart OCR] Step 5 completed in ${pass2Duration}s, extracted ${jsonTable.length} records`);
         confidence = structureAnalysis.confidence || (jsonTable.length > 0 ? "medium" : "low");
       } catch (geminiError) {
-        console.error(`❌ [Smart OCR] Gemini Pass #2 failed:`, geminiError);
+        const pass2Duration = ((Date.now() - pass2StartTime) / 1000).toFixed(2);
+        console.error(`❌ [Smart OCR] Gemini Pass #2 failed after ${pass2Duration}s:`, geminiError);
         jsonTable = [];
         confidence = "low";
       }
@@ -1921,6 +1933,7 @@ exports.smartOcr = onRequest(
         }
 
         console.log(`⏱️ [Smart OCR] Starting Smart OCR processing...`);
+        console.log(`📊 [Smart OCR] Estimated time: 3-8 minutes (depending on document size and Gemini API response)`);
         const startTime = Date.now();
         
         const result = await smartOcrPdf(
@@ -1931,7 +1944,9 @@ exports.smartOcr = onRequest(
         );
         
         const duration = Date.now() - startTime;
-        console.log(`✅ [Smart OCR] Processing completed in ${(duration / 1000).toFixed(2)} seconds`);
+        const durationSeconds = (duration / 1000).toFixed(2);
+        const durationMinutes = (duration / 60000).toFixed(2);
+        console.log(`✅ [Smart OCR] Processing completed in ${durationSeconds}s (${durationMinutes} minutes)`);
         console.log(`📊 [Smart OCR] Returning result:`, {
           success: true,
           recordsCount: result.records?.length || 0,
