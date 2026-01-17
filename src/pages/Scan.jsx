@@ -44,9 +44,10 @@ import {
   createSeparateExcelFiles,
   createCombinedExcelFile,
   createExcelFile,
+  createVisionExcelFile,
 } from "../services/excel.service"
 import { runOCR } from "../utils/runOCR"
-import { smartOcrPdf } from "../services/smartOcr.service"
+import { smartOcrPdf, smartOcrVisionPdf } from "../services/smartOcr.service"
 
 // Batch Scan Configuration
 const BATCH_SIZE = 10 // Number of pages per batch
@@ -158,6 +159,7 @@ function calculatePagesToScan(pageRange, startPage, endPage, totalPages) {
 export default function Scan({ credits, files, setFiles, onNext, columnConfig, onConsume }) {
   const [loadingFiles, setLoadingFiles] = useState(new Set())
   const [mode, setMode] = useState("separate")
+  const [scanMode, setScanMode] = useState("ocr") // OCR or Vision mode: "ocr" | "vision"
   const [fileType, setFileType] = useState("xlsx")
   const [status, setStatus] = useState("idle")
   const [progress, setProgress] = useState(0)
@@ -631,17 +633,21 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
    * @param {Array} data - Extracted data rows
    * @returns {Promise<void>} Promise that resolves when download is complete
    */
-  const exportSingleFile = async (filename, data) => {
+  const exportSingleFile = async (filename, data, currentScanMode = "ocr") => {
     const configToUse = columnConfig || []
     
     if (fileType === "xlsx") {
       if (mode === "separate") {
         // Export immediately as separate file
         const baseName = filename.replace(/\.[^/.]+$/, "")
-        console.log(`💾 [BatchScan] Starting export: ${baseName}.xlsx`)
+        console.log(`💾 [BatchScan] Starting export: ${baseName}.xlsx (mode: ${currentScanMode})`)
         
-        // Trigger download
-        createExcelFile(data, configToUse, `${baseName}.xlsx`)
+        // Trigger download - use Vision Excel export if scanMode is "vision"
+        if (currentScanMode === "vision") {
+          createVisionExcelFile(data, `${baseName}.xlsx`)
+        } else {
+          createExcelFile(data, configToUse, `${baseName}.xlsx`)
+        }
         
         // Wait for browser to process the download (give it time to start)
         // This ensures the download dialog appears and browser processes it
@@ -872,20 +878,36 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 }))
                 console.log(`📋 [BatchScan] ColumnDefinitions:`, columnDefinitions.length, "columns", columnDefinitions.map(c => `${c.columnKey}(${c.label})`).join(", "))
                 
-                // Call Smart OCR with timeout (5 minutes)
-                console.log(`⏱️ [BatchScan] Starting Smart OCR with 5-minute timeout...`)
-                setCurrentFile(`กำลังประมวลผล Smart OCR: ${fileState.originalName}...`)
+                // Call Smart OCR or Vision API based on scanMode
+                const apiName = scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"
+                console.log(`⏱️ [BatchScan] Starting ${apiName} with 12-minute timeout...`)
+                setCurrentFile(`กำลังประมวลผล ${apiName}: ${fileState.originalName}...`)
                 setProgress(85) // Update progress to show Smart OCR is running
                 
-                const smartOcrResult = await Promise.race([
-                  smartOcrPdf(fileState.file, columnDefinitions),
-                  new Promise((_, reject) =>
-                    setTimeout(
-                      () => reject(new Error("Smart OCR timeout: เกิน 5 นาที")),
-                      5 * 60 * 1000 // 5 minutes
-                    )
-                  ),
-                ])
+                let smartOcrResult
+                if (scanMode === "vision") {
+                  // Vision mode: call smartOcrVisionPdf (no columnDefinitions needed)
+                  smartOcrResult = await Promise.race([
+                    smartOcrVisionPdf(fileState.file),
+                    new Promise((_, reject) =>
+                      setTimeout(
+                        () => reject(new Error(`${apiName} timeout: เกิน 12 นาที`)),
+                        12 * 60 * 1000 // 12 minutes (720 seconds) to match backend timeout
+                      )
+                    ),
+                  ])
+                } else {
+                  // OCR mode: call smartOcrPdf (with columnDefinitions)
+                  smartOcrResult = await Promise.race([
+                    smartOcrPdf(fileState.file, columnDefinitions),
+                    new Promise((_, reject) =>
+                      setTimeout(
+                        () => reject(new Error(`${apiName} timeout: เกิน 12 นาที`)),
+                        12 * 60 * 1000 // 12 minutes (720 seconds) to match backend timeout
+                      )
+                    ),
+                  ])
+                }
                 
                 console.log(`✅ [BatchScan] Smart OCR API call completed`)
                 setProgress(90) // Update progress after Smart OCR completes
@@ -900,7 +922,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 })
                 
                 if (smartOcrResult && smartOcrResult.records && smartOcrResult.records.length > 0) {
-                  console.log(`✅ [BatchScan] Smart OCR completed: ${smartOcrResult.records.length} records`)
+                  console.log(`✅ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} completed: ${smartOcrResult.records.length} records`)
                   
                   // Send raw records to Excel export (will be mapped to Excel format in excel.service.js)
                   // 1 record = 1 row in Excel
@@ -913,7 +935,8 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                     
                     // Export single file immediately and wait for download to complete
                     // Pass raw records, not mapped rows
-                    await exportSingleFile(fileState.originalName, smartOcrResult.records)
+                    // Use Vision Excel export if scanMode is "vision"
+                    await exportSingleFile(fileState.originalName, smartOcrResult.records, scanMode)
                     
                     console.log(`✅ [BatchScan] File exported and download completed: ${fileState.originalName}`)
                     
@@ -929,13 +952,27 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                     console.log(`✅ [BatchScan] Added ${smartOcrResult.records.length} records to combined data for ${fileState.originalName}`)
                   }
                 } else {
-                  const errorMsg = smartOcrResult?.metadata?.errorMessage || "Unknown error"
-                  const validationErrors = smartOcrResult?.metadata?.validationErrors || []
-                  console.error(`❌ [BatchScan] Smart OCR returned no records for: ${fileState.originalName}`)
-                  console.error(`❌ [BatchScan] Error message:`, errorMsg)
-                  console.error(`❌ [BatchScan] Validation errors:`, validationErrors)
-                  console.error(`❌ [BatchScan] Full result:`, smartOcrResult)
-                  setError(`Smart OCR ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
+                  // Safety guard: Check if response.success === false
+                  if (smartOcrResult && smartOcrResult.success === false) {
+                    const errorMsg = smartOcrResult.error || "Unknown error"
+                    console.error(`❌ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} failed for: ${fileState.originalName}`)
+                    console.error(`❌ [BatchScan] Error:`, errorMsg)
+                    setError(`${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
+                  } else if (!smartOcrResult || !smartOcrResult.records || smartOcrResult.records.length === 0) {
+                    // Safety guard: Check if records.length === 0
+                    const errorMsg = smartOcrResult?.metadata?.errorMessage || "ไม่พบข้อมูล"
+                    console.error(`❌ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} returned no records for: ${fileState.originalName}`)
+                    console.error(`❌ [BatchScan] Error message:`, errorMsg)
+                    setError(`${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} ไม่พบข้อมูลสำหรับ ${fileState.originalName}. ${errorMsg}`)
+                  } else {
+                    const errorMsg = smartOcrResult?.metadata?.errorMessage || "Unknown error"
+                    const validationErrors = smartOcrResult?.metadata?.validationErrors || []
+                    console.error(`❌ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} returned no records for: ${fileState.originalName}`)
+                    console.error(`❌ [BatchScan] Error message:`, errorMsg)
+                    console.error(`❌ [BatchScan] Validation errors:`, validationErrors)
+                    console.error(`❌ [BatchScan] Full result:`, smartOcrResult)
+                    setError(`${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
+                  }
                 }
               } catch (smartOcrError) {
                 console.error(`❌ [BatchScan] Smart OCR failed for ${fileState.originalName}:`, smartOcrError)
@@ -1648,6 +1685,55 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                   )}
                 </CardContent>
               </Card>
+
+              {/* Scan Mode Selector */}
+              {files.length > 0 && (
+                <Card sx={{ boxShadow: "0 4px 12px rgba(0,0,0,0.08)", borderRadius: 2 }}>
+                  <CardContent sx={{ p: 2 }}>
+                    <Typography variant="subtitle2" fontWeight={600} sx={{ mb: 1.5, color: "#1e293b" }}>
+                      Scan Mode
+                    </Typography>
+                    <RadioGroup
+                      value={scanMode}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        if (value === "ocr" || value === "vision") {
+                          setScanMode(value);
+                        }
+                      }}
+                      row
+                    >
+                      <FormControlLabel
+                        value="ocr"
+                        control={<Radio size="small" />}
+                        label="OCR (แบบเดิม)"
+                        sx={{
+                          "& .MuiFormControlLabel-label": {
+                            fontSize: "0.875rem",
+                            color: "#475569",
+                          },
+                        }}
+                      />
+                      <FormControlLabel
+                        value="vision"
+                        control={<Radio size="small" />}
+                        label="Vision (AI อ่านจากภาพ)"
+                        sx={{
+                          "& .MuiFormControlLabel-label": {
+                            fontSize: "0.875rem",
+                            color: "#475569",
+                          },
+                        }}
+                      />
+                    </RadioGroup>
+                    {scanMode === "vision" && (
+                      <Typography variant="caption" sx={{ color: "#10b981", mt: 1, display: "block" }}>
+                        ✓ ใช้ AI อ่านข้อมูลจากภาพโดยตรง (ไม่ผ่าน OCR)
+                      </Typography>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
 
               {/* Credit Warning */}
               {files.length > 0 && !creditEnough && (

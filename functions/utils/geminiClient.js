@@ -112,6 +112,78 @@ async function generateGeminiText(prompt, options = {}) {
 }
 
 /**
+ * Generate text from Gemini Vision API using image input
+ * 
+ * @param {Buffer} imageBuffer - Image buffer (PNG/JPEG)
+ * @param {string} prompt - Prompt text
+ * @param {Object} options - Generation options
+ * @param {number} options.maxOutputTokens - Maximum output tokens (default: 8192)
+ * @param {number} options.temperature - Temperature (default: 0)
+ * @returns {Promise<string>} Generated text response
+ */
+async function generateGeminiVision(imageBuffer, prompt, options = {}) {
+  try {
+    // Initialize Gemini client
+    const client = initializeGeminiClient();
+
+    // Get model
+    const model = client.getGenerativeModel({
+      model: MODEL_NAME,
+      generationConfig: {
+        maxOutputTokens: options.maxOutputTokens || 8192,
+        temperature: options.temperature !== undefined ? options.temperature : 0,
+      },
+    });
+
+    // Convert image buffer to base64
+    const imageBase64 = imageBuffer.toString('base64');
+    
+    // Detect MIME type from buffer signature
+    let mimeType = 'image/png'; // Default
+    if (imageBuffer.length >= 4) {
+      // PNG signature: 89 50 4E 47
+      if (imageBuffer[0] === 0x89 && imageBuffer[1] === 0x50 && imageBuffer[2] === 0x4E && imageBuffer[3] === 0x47) {
+        mimeType = 'image/png';
+      }
+      // JPEG signature: FF D8 FF
+      else if (imageBuffer[0] === 0xFF && imageBuffer[1] === 0xD8 && imageBuffer[2] === 0xFF) {
+        mimeType = 'image/jpeg';
+      }
+    }
+
+    // Generate content with image
+    console.log(`🤖 [Gemini Vision] Calling ${MODEL_NAME} with image input...`);
+    console.log(`📊 [Gemini Vision] Image size: ${imageBuffer.length} bytes`);
+    console.log(`📊 [Gemini Vision] Prompt length: ${prompt.length} characters`);
+    console.log(`📊 [Gemini Vision] Max output tokens: ${options.maxOutputTokens || 8192}`);
+    
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          data: imageBase64,
+          mimeType: mimeType,
+        },
+      },
+      { text: prompt },
+    ]);
+    
+    const response = await result.response;
+    const text = response.text();
+    
+    if (!text || text.trim().length === 0) {
+      throw new Error("Gemini Vision returned empty response");
+    }
+    
+    console.log(`✅ [Gemini Vision] Generated ${text.length} characters`);
+    
+    return text;
+  } catch (error) {
+    console.error(`❌ [Gemini Vision] Error generating vision content:`, error);
+    throw new Error(`Gemini Vision generation failed: ${error.message}`);
+  }
+}
+
+/**
  * Pass #1: Analyze document structure
  * 
  * @param {string} text - Normalized text from PDF/OCR
@@ -433,9 +505,10 @@ function extractJson(text) {
  * @param {Object} structureAnalysis - Result from Pass #1 (unused but kept for compatibility)
  * @param {Array} columnDefinitions - Column definitions from template
  * @param {string} apiKey - DEPRECATED: Not used (kept for compatibility)
+ * @param {number} maxSequence - Maximum sequence number found in document (optional)
  * @returns {Promise<Array>} JSON array of records
  */
-async function convertToJsonTable(text, structureAnalysis, columnDefinitions, apiKey) {
+async function convertToJsonTable(text, structureAnalysis, columnDefinitions, apiKey, maxSequence = 0) {
   // Log input
   const MAX_TEXT_LENGTH = 1000000;
   const textLength = text.length;
@@ -452,19 +525,29 @@ async function convertToJsonTable(text, structureAnalysis, columnDefinitions, ap
     ? columnKeys.map(c => `- ${c}`).join("\n")
     : "- name\n- address\n- age\n- zone\n- province\n- district\n- subDistrict\n- village";
   
+  // Add max sequence info to prompt if available
+  const maxSequenceInfo = maxSequence > 0 
+    ? `\n**ข้อมูลสำคัญ: พบลำดับที่สูงสุดในเอกสารคือ ${maxSequence} ดังนั้นต้องสร้าง records ให้ครบ ${maxSequence} records เท่านั้น (sequence 1, 2, 3, ..., ${maxSequence}) ห้ามสร้างเกิน ${maxSequence} records**`
+    : `\n**ข้อมูลสำคัญ: ต้องหาลำดับที่สูงสุดในเอกสารทั้งหมดก่อน แล้วสร้าง records ให้ครบทุกลำดับที่ตั้งแต่ 1 ถึงลำดับที่สูงสุด ห้ามสร้างเกินลำดับที่สูงสุด**`;
+
   const prompt = `คุณคือระบบแปลงเอกสารราชการเป็นข้อมูลตาราง
 
 โครงสร้างเอกสาร:
 ${structureAnalysis?.recordDefinition || "1 บรรทัด = 1 record"}
 ${structureAnalysis?.dataRelationships ? `\nความสัมพันธ์ข้อมูล: ${structureAnalysis.dataRelationships}` : ""}
+${maxSequenceInfo}
 
 **กติกาสำคัญที่สุด (อ่านให้ละเอียด):**
+- **ต้องสร้าง records ให้ครบ ${maxSequence > 0 ? `**${maxSequence} records เท่านั้น**` : '**จำนวน records เท่ากับลำดับที่สูงสุด**'} (sequence 1, 2, 3, ..., ${maxSequence > 0 ? maxSequence : 'ลำดับที่สูงสุด'})**
+- **${maxSequence > 0 ? `**ห้ามสร้างเกิน ${maxSequence} records**` : '**ห้ามสร้างเกินลำดับที่สูงสุด**'}**
+- **ห้ามตัดบรรทัดทิ้ง ให้สร้าง record แม้ข้อมูลจะว่าง (ใส่ "" สำหรับข้อมูลที่ว่าง)**
 - **1 คน = 1 record เท่านั้น (ห้ามแยกชื่อออกเป็นหลาย records)**
 - **ต้องรวมชื่อที่แยกกันให้เป็น record เดียว (เช่น "จินตนา" + "วงษ์" + "ศิลป์" = "จินตนา วงษ์ ศิลป์" ใน record เดียว)**
-- **ลำดับที่ (sequence) เป็นตัวบอกจำนวน records ที่ควรมี (ถ้าพบลำดับที่ 66 ควรมีประมาณ 66 records)**
+- **ลำดับที่ (sequence) เป็นตัวบอกจำนวน records ที่ควรมี - ต้องสร้าง record ให้ครบทุกลำดับที่ตั้งแต่ 1 ถึงลำดับที่สูงสุด${maxSequence > 0 ? ` (${maxSequence})` : ''}**
 - **ถ้าพบลำดับที่ใหม่ → สร้าง record ใหม่ (1 record ต่อ 1 ลำดับที่)**
-- **ถ้าข้อมูลไม่ชัด → ใส่ "" (string ว่าง) แต่ต้องสร้าง record**
-- **ห้ามข้ามลำดับที่ใดเลย**
+- **ถ้าข้อมูลไม่ชัดหรือว่าง → ใส่ "" (string ว่าง) แต่ต้องสร้าง record ให้ครบ**
+- **ห้ามข้ามลำดับที่ใดเลย - ต้องมี record ทุกลำดับที่ตั้งแต่ 1 ถึงลำดับที่สูงสุด${maxSequence > 0 ? ` (${maxSequence})` : ''}**
+- **ต้องอ่านข้อมูลทุกหน้าในเอกสาร - ห้ามหยุดแค่หน้าแรก**
 
 กติกาเด็ดขาด:
 - 1 คน = 1 record เท่านั้น
@@ -474,9 +557,10 @@ ${structureAnalysis?.dataRelationships ? `\nความสัมพันธ์
 - ห้ามสร้าง Group
 - ห้าม nested object หรือ array
 - ห้ามเดาข้อมูล
-- ถ้าข้อมูลไม่ชัด → ใส่ "" (string ว่าง)
+- **ถ้าข้อมูลว่าง → ใส่ "" (string ว่าง) แต่ต้องสร้าง record**
 - ห้ามแก้ไขตัวเลขหรือสะกดชื่อจากที่ปรากฏในเอกสาร
 - **ต้องแสดงข้อมูลทุกบรรทัด ไม่ข้ามบรรทัดใด**
+- **ห้ามตัดบรรทัดทิ้ง - ถ้าบรรทัดว่างให้สร้าง record ว่างแทน**
 
 Semantic rule สำคัญ:
 - บ้านเลขที่อาจปรากฏเพียงครั้งเดียว
@@ -484,7 +568,12 @@ Semantic rule สำคัญ:
 - จนกว่าจะพบบ้านเลขที่ใหม่
 - ถ้าพบลำดับที่ใหม่ → สร้าง record ใหม่ทันที
 - **ชื่อที่แยกกันในบรรทัดเดียวกันหรือใกล้กัน ให้รวมเป็น record เดียว**
-- **ลำดับที่ (sequence) เป็นตัวบอกจำนวน records ที่ควรมี**
+- **ลำดับที่ (sequence) เป็นตัวบอกจำนวน records ที่ควรมี - ต้องสร้างให้ครบทุกลำดับที่**
+
+**ข้อมูลสำคัญที่ต้อง extract:**
+- **ชื่อคน (name) - ต้องรวมชื่อที่แยกกันให้เป็นชื่อเต็ม**
+- **บ้านเลขที่ (houseNumber) - ถ้าว่างให้เว้นไว้**
+- **ลำดับที่ (sequence) - ใช้เป็นตัวบอกจำนวน records**
 
 column ที่ต้องใช้ (key ของ JSON ต้องตรงตามนี้เท่านั้น):
 ${columnsList}
@@ -492,8 +581,11 @@ ${columnsList}
 กติกาการตอบ:
 - ตอบเป็น JSON object ที่มี "rows" array เท่านั้น
 - Format: { "rows": [ {...}, {...} ] }
-- **จำนวน records ควรใกล้เคียงกับลำดับที่สูงสุดที่พบในเอกสาร**
+- **จำนวน records ต้องเท่ากับ ${maxSequence > 0 ? `**${maxSequence} records เท่านั้น**` : '**ลำดับที่สูงสุด**'} (sequence 1, 2, 3, ..., ${maxSequence > 0 ? maxSequence : 'ลำดับที่สูงสุด'})**
+- **${maxSequence > 0 ? `**ห้ามสร้างเกิน ${maxSequence} records**` : '**ห้ามสร้างเกินลำดับที่สูงสุด**'}**
 - **ห้ามแยกชื่อเดียวกันออกเป็นหลาย records**
+- **ห้ามตัดบรรทัดทิ้ง - ถ้าบรรทัดว่างให้สร้าง record ว่าง (ใส่ "" ในทุก field)**
+- **ห้ามหยุดแค่ลำดับที่ที่พบก่อน - ต้องหาลำดับที่สูงสุดก่อนแล้วสร้างให้ครบ${maxSequence > 0 ? ` (${maxSequence} records)` : ''}**
 - ห้ามมีข้อความอื่นก่อนหรือหลัง JSON
 - ห้ามอธิบาย ห้ามใส่คำอธิบายประกอบ หรือ comment ใด ๆ
 - ห้ามใช้ markdown code block
@@ -604,6 +696,8 @@ ${text.substring(0, MAX_TEXT_LENGTH)}
 }
 
 module.exports = {
+  generateGeminiText,
+  generateGeminiVision,
   analyzeDocumentStructure,
   convertToJsonTable,
 };
