@@ -19,8 +19,8 @@ try {
   console.warn("⚠️ [Gemini Client] @google/generative-ai not installed. Run: npm install @google/generative-ai");
 }
 
-// Model name - Use gemini-2.5-flash (tested and confirmed working with this API key)
-const MODEL_NAME = "gemini-2.5-flash"; // Latest stable model that works with SDK
+// Model name - Use gemini-2.5-pro
+const MODEL_NAME = "gemini-2.5-pro"; // Gemini 2.5 Pro model
 
 // Singleton Gemini client instance
 let genAI = null;

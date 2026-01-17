@@ -14,7 +14,6 @@ import {
 import HomeIcon from "@mui/icons-material/Home"
 import SettingsIcon from "@mui/icons-material/Settings"
 import ScannerIcon from "@mui/icons-material/Scanner"
-import DescriptionIcon from "@mui/icons-material/Description"
 import LogoutIcon from "@mui/icons-material/Logout"
 import { auth } from "../firebase"
 import { getUserProfile } from "../services/user.service"
@@ -89,7 +88,6 @@ export default function Sidebar({ page, onNavigate, onLogout, credits: creditsFr
   const menu = [
     { key: "home", label: "หน้าแรก", icon: <HomeIcon /> },
     { key: "scan", label: "สแกนเอกสาร", icon: <ScannerIcon /> },
-    { key: "template-settings", label: "ตั้งค่าเทมเพลต", icon: <DescriptionIcon /> },
     { key: "settings", label: "ตั้งค่า", icon: <SettingsIcon /> },
   ]
 

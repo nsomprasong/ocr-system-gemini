@@ -159,10 +159,11 @@ function calculatePagesToScan(pageRange, startPage, endPage, totalPages) {
 export default function Scan({ credits, files, setFiles, onNext, columnConfig, onConsume }) {
   const [loadingFiles, setLoadingFiles] = useState(new Set())
   const [mode, setMode] = useState("separate")
-  const [scanMode, setScanMode] = useState("ocr") // OCR or Vision mode: "ocr" | "vision"
+  const [scanMode, setScanMode] = useState("vision") // OCR or Vision mode: "ocr" | "vision"
   const [fileType, setFileType] = useState("xlsx")
   const [status, setStatus] = useState("idle")
   const [progress, setProgress] = useState(0)
+  const [progressMessage, setProgressMessage] = useState("")
   const [currentFile, setCurrentFile] = useState("")
   const [error, setError] = useState("")
   const [ocrResults, setOcrResults] = useState([])
@@ -882,16 +883,68 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 const apiName = scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"
                 console.log(`⏱️ [BatchScan] Starting ${apiName} with 12-minute timeout...`)
                 setCurrentFile(`กำลังประมวลผล ${apiName}: ${fileState.originalName}...`)
-                setProgress(85) // Update progress to show Smart OCR is running
+                
+                // Reset progress for new file (100% = 1 file)
+                setProgress(0)
+                setProgressMessage("กำลังเริ่มต้น...")
+                
+                // Progress tracking for Vision mode
+                let progressInterval = null
+                if (scanMode === "vision") {
+                  // Simulate progress updates while waiting for response
+                  let progressStep = 10 // Start from 10%
+                  let progressStage = 0 // 0: converting, 1: classifying, 2: extracting
+                  
+                  progressInterval = setInterval(() => {
+                    progressStep += 2
+                    if (progressStep <= 30) {
+                      // Stage 0: Converting PDF to images
+                      progressStage = 0
+                      setProgress(Math.min(30, progressStep))
+                      setProgressMessage("กำลังแปลง PDF เป็นภาพ...")
+                    } else if (progressStep <= 60) {
+                      // Stage 1: Classifying pages
+                      progressStage = 1
+                      setProgress(Math.min(60, progressStep))
+                      setProgressMessage("กำลังวิเคราะห์ประเภทหน้าเอกสาร...")
+                    } else if (progressStep <= 90) {
+                      // Stage 2: Extracting data
+                      progressStage = 2
+                      const estimatedPage = Math.floor((progressStep - 60) / 30 * (fileState.pageCount || 1))
+                      setProgress(Math.min(90, progressStep))
+                      setProgressMessage(`กำลังส่งภาพเข้า Gemini หน้าที่ ${Math.max(1, estimatedPage)}...`)
+                    }
+                  }, 2000) // Update every 2 seconds
+                } else {
+                  setProgress(85)
+                  setProgressMessage("กำลังประมวลผล OCR...")
+                }
                 
                 let smartOcrResult
                 if (scanMode === "vision") {
                   // Vision mode: call smartOcrVisionPdf (no columnDefinitions needed)
                   smartOcrResult = await Promise.race([
-                    smartOcrVisionPdf(fileState.file),
+                    smartOcrVisionPdf(fileState.file).then((result) => {
+                      // Clear interval when response is received
+                      if (progressInterval) {
+                        clearInterval(progressInterval)
+                        progressInterval = null
+                      }
+                      // Update progress message from response if available
+                      if (result.metadata?.progress) {
+                        setProgressMessage(result.metadata.progress.message || "ประมวลผลเสร็จสิ้น")
+                      }
+                      return result
+                    }),
                     new Promise((_, reject) =>
                       setTimeout(
-                        () => reject(new Error(`${apiName} timeout: เกิน 12 นาที`)),
+                        () => {
+                          if (progressInterval) {
+                            clearInterval(progressInterval)
+                            progressInterval = null
+                          }
+                          reject(new Error(`${apiName} timeout: เกิน 12 นาที`))
+                        },
                         12 * 60 * 1000 // 12 minutes (720 seconds) to match backend timeout
                       )
                     ),
@@ -909,8 +962,15 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                   ])
                 }
                 
+                // Clear interval if still running
+                if (progressInterval) {
+                  clearInterval(progressInterval)
+                  progressInterval = null
+                }
+                
                 console.log(`✅ [BatchScan] Smart OCR API call completed`)
                 setProgress(90) // Update progress after Smart OCR completes
+                setProgressMessage("กำลังเตรียมข้อมูลสำหรับส่งออก...")
                 
                 console.log(`📊 [BatchScan] Smart OCR result:`, {
                   hasRecords: !!(smartOcrResult?.records),
@@ -936,9 +996,13 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                     // Export single file immediately and wait for download to complete
                     // Pass raw records, not mapped rows
                     // Use Vision Excel export if scanMode is "vision"
+                    setProgress(95)
+                    setProgressMessage("กำลังดาวน์โหลดไฟล์...")
                     await exportSingleFile(fileState.originalName, smartOcrResult.records, scanMode)
                     
                     console.log(`✅ [BatchScan] File exported and download completed: ${fileState.originalName}`)
+                    setProgress(100)
+                    setProgressMessage("เสร็จสิ้น")
                     
                     // Small delay to ensure download dialog is processed
                     await new Promise((resolve) => setTimeout(resolve, 200))
@@ -1686,55 +1750,6 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 </CardContent>
               </Card>
 
-              {/* Scan Mode Selector */}
-              {files.length > 0 && (
-                <Card sx={{ boxShadow: "0 4px 12px rgba(0,0,0,0.08)", borderRadius: 2 }}>
-                  <CardContent sx={{ p: 2 }}>
-                    <Typography variant="subtitle2" fontWeight={600} sx={{ mb: 1.5, color: "#1e293b" }}>
-                      Scan Mode
-                    </Typography>
-                    <RadioGroup
-                      value={scanMode}
-                      onChange={(e) => {
-                        const value = e.target.value;
-                        if (value === "ocr" || value === "vision") {
-                          setScanMode(value);
-                        }
-                      }}
-                      row
-                    >
-                      <FormControlLabel
-                        value="ocr"
-                        control={<Radio size="small" />}
-                        label="OCR (แบบเดิม)"
-                        sx={{
-                          "& .MuiFormControlLabel-label": {
-                            fontSize: "0.875rem",
-                            color: "#475569",
-                          },
-                        }}
-                      />
-                      <FormControlLabel
-                        value="vision"
-                        control={<Radio size="small" />}
-                        label="Vision (AI อ่านจากภาพ)"
-                        sx={{
-                          "& .MuiFormControlLabel-label": {
-                            fontSize: "0.875rem",
-                            color: "#475569",
-                          },
-                        }}
-                      />
-                    </RadioGroup>
-                    {scanMode === "vision" && (
-                      <Typography variant="caption" sx={{ color: "#10b981", mt: 1, display: "block" }}>
-                        ✓ ใช้ AI อ่านข้อมูลจากภาพโดยตรง (ไม่ผ่าน OCR)
-                      </Typography>
-                    )}
-                  </CardContent>
-                </Card>
-              )}
-
               {/* Credit Warning */}
               {files.length > 0 && !creditEnough && (
                 <Alert 
@@ -1752,92 +1767,9 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
             </Stack>
           </Grid>
 
-          {/* Right Column: Export Settings & Action */}
+          {/* Right Column: Action */}
           <Grid size={{ xs: 12, lg: 4 }}>
             <Stack spacing={2} sx={{ position: "sticky", top: 20 }}>
-              {/* Export Settings Card */}
-              {files.length > 0 && (
-                <Card sx={{ boxShadow: "0 4px 12px rgba(0,0,0,0.08)", borderRadius: 2 }}>
-                  <CardContent sx={{ p: 0 }}>
-                    <Box sx={{ 
-                      background: "linear-gradient(135deg, #334155 0%, #475569 100%)",
-                      p: 2,
-                      borderTopLeftRadius: 8,
-                      borderTopRightRadius: 8,
-                    }}>
-                      <Typography variant="h6" fontWeight={600} sx={{ color: "#ffffff", fontSize: "1.1rem" }}>
-                        ตั้งค่าการส่งออก
-                      </Typography>
-                    </Box>
-                    <Box sx={{ p: 2 }}>
-                      <Stack spacing={2}>
-                        {/* Export Mode */}
-                        <Box>
-                          <Typography variant="body2" fontWeight={500} sx={{ mb: 1, color: "#1e293b" }}>
-                            รูปแบบการบันทึกไฟล์
-                          </Typography>
-                          <RadioGroup
-                            value={mode}
-                            onChange={(e) => setMode(e.target.value)}
-                          >
-                            <FormControlLabel
-                              value="separate"
-                              control={<Radio size="small" />}
-                              label="แยกไฟล์"
-                            />
-                            <FormControlLabel
-                              value="combine"
-                              control={<Radio size="small" />}
-                              label="รวมเป็นไฟล์เดียว"
-                            />
-                          </RadioGroup>
-                        </Box>
-
-                        <Divider />
-
-                        {/* File Type */}
-                        <Box>
-                          <Typography variant="body2" fontWeight={500} sx={{ mb: 1, color: "#1e293b" }}>
-                            ประเภทไฟล์
-                          </Typography>
-                          <RadioGroup
-                            value={fileType}
-                            onChange={(e) => setFileType(e.target.value)}
-                          >
-                            <FormControlLabel
-                              value="xlsx"
-                              control={<Radio size="small" />}
-                              label="Excel (.xlsx)"
-                            />
-                            <FormControlLabel
-                              value="doc"
-                              control={<Radio size="small" />}
-                              label="Word (.docx)"
-                            />
-                          </RadioGroup>
-                        </Box>
-
-                        <Divider />
-
-                        {/* Destination */}
-                        <Box>
-                          <Typography variant="body2" fontWeight={500} sx={{ mb: 1, color: "#1e293b" }}>
-                            ปลายทางจัดเก็บไฟล์
-                          </Typography>
-                          <TextField
-                            fullWidth
-                            size="small"
-                            disabled
-                            value="โฟลเดอร์ Downloads"
-                            sx={{ mt: 0.5 }}
-                          />
-                        </Box>
-                      </Stack>
-                    </Box>
-                  </CardContent>
-                </Card>
-              )}
-
               {/* Action Card - แสดงเฉพาะเมื่อมีไฟล์ */}
               {files.length > 0 && (
                 <Card sx={{ boxShadow: "0 4px 12px rgba(0,0,0,0.08)", borderRadius: 2 }}>
@@ -1889,7 +1821,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                             value={progress} 
                             sx={{ height: 6, borderRadius: 3, mb: 1 }}
                           />
-                          <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
                             <Typography variant="caption" color="text.secondary">
                               {Math.round(progress)}% เสร็จสมบูรณ์
                             </Typography>
@@ -1905,6 +1837,20 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                               ⏱️ {formatTime(elapsedTime)}
                             </Typography>
                           </Box>
+                          {progressMessage && (
+                            <Typography 
+                              variant="body2" 
+                              sx={{ 
+                                color: "#475569",
+                                fontSize: "0.875rem",
+                                mb: 1,
+                                textAlign: "center",
+                                fontStyle: "italic"
+                              }}
+                            >
+                              {progressMessage}
+                            </Typography>
+                          )}
                         </Box>
                       )}
 

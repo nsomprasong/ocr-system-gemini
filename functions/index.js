@@ -1362,10 +1362,21 @@ function buildVisionPrompt(pageNumber, template) {
     
     switch (key) {
       case "name":
-        description += `Thai full name - EXTRACT EXACTLY AS SEEN
+        description += `Thai full name - PRIMARY SOURCE OF TRUTH (EXTRACT EXACTLY AS SEEN)
+  - **CRITICAL: PERSON NAMES are PRIMARY SOURCE OF TRUTH - PRESERVE ALL NAMES**
   - **CRITICAL: NO GUESSING, NO MODIFICATION**
+  - Detect ALL visible person names under the name column header
+  - A name MUST be kept if it is visually readable, even if:
+    * X-axis alignment is slightly off
+    * The name spans multiple lines
+    * The row height differs from others
+    * Neighboring columns are noisy
   - Read the name EXACTLY as it appears in the document
   - PRESERVE everything: titles ("นาย", "นาง", "น.ส.", "น.ส"), spaces, all words
+  - **MULTI-LINE NAME RULE:**
+    * If a name spans multiple visual lines → merge those lines into ONE name field
+    * Preserve original order and spacing
+    * Extract EXACTLY as seen across all lines
   - ONLY remove "/" symbol if it appears at the VERY START (e.g., "/ ชื่อ" → "ชื่อ")
   - DO NOT remove, add, or modify any other characters
   - DO NOT normalize spacing
@@ -1373,29 +1384,65 @@ function buildVisionPrompt(pageNumber, template) {
   - DO NOT clean or fix OCR errors
   - Extract EXACTLY what you see in the name column
   - If you see "นายสมชาย ใจดี" → extract "นายสมชาย ใจดี" (exactly)
-  - If you see "น.ส.เบญจมาศ ขนบ" → extract "น.ส.เบญจมาศ ขนบ" (exactly)`;
+  - If you see "น.ส.เบญจมาศ ขนบ" → extract "น.ส.เบญจมาศ ขนบ" (exactly)
+  - **CRITICAL: NEVER discard a name due to minor alignment issues**
+  - **CRITICAL: A row EXISTS if a NAME exists (even if all dependent fields are empty)**`;
         break;
       case "address":
-        description += `House number (บ้านเลขที่) - EXTRACT EXACTLY AS SEEN
-  - **CRITICAL: NO GUESSING, NO MODIFICATION**
-  - **FIRST: Identify the "บ้านเลขที่" column in the table**
-    - Look for column header: "บ้านเลขที่", "เลขที่", "บ้าน", "เลขหมายประจำบ้าน"
-    - This column typically contains numbers (1, 2, 10, 12/3, 10-15, etc.)
-    - It is usually positioned after the name column
-  - **THEN: Extract EXACTLY what you see in THIS SPECIFIC COLUMN in the SAME row**
-    - For each person row, read the value EXACTLY as it appears in the "บ้านเลขที่" column
-    - The house number MUST be from the SAME row as the person's name
+        description += `House number (บ้านเลขที่) - HEADER-LOCKED + ROW-LOCKED EXTRACTION
+  - **CRITICAL: HEADER X-RANGE + Y-AXIS OVERLAP REQUIRED**
+  - **STEP 1: Detect headers and lock X-axis ranges**
+    - Detect the table header row visually
+    - Identify the "บ้านเลขที่" header by its text: "เลขหมายประจำบ้าน", "บ้านเลขที่", "เลขที่", "บ้าน"
+    - Lock the X-axis range (left X, right X) for the houseNumber header
+    - Identify the "ลำดับที่" header and lock its X-axis range (MARK as IGNORE for houseNumber)
+    - Identify the name header ("ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล") and lock its X-axis range
+    - **CRITICAL: Headers are FIXED SEMANTIC ANCHORS - data MUST obey headers**
+  - **STEP 2: HEADER-BASED NUMERIC FIELD DISAMBIGUATION (MANDATORY)**
+    - For each numeric value, check which header's X-range it falls under:
+      * Falls under "เลขหมายประจำบ้าน" or "บ้านเลขที่" header X-range → houseNumber candidate
+      * Falls under "ลำดับที่" header X-range → orderIndex (IGNORE, do NOT use)
+      * Does NOT fall under any header X-range → IGNORE (do NOT use)
+    - **ONLY use numeric values that fall within houseNumber header X-range**
+    - **IGNORE all numeric values from "ลำดับที่" header X-range (orderIndex)**
+    - Header X-range alignment OVERRIDES position rules
+  - **STEP 3: Y-AXIS OVERLAP VERIFICATION (MANDATORY - ROW-LOCAL)**
+    - **CRITICAL: Evaluate EACH row independently (NON-PROPAGATING)**
+    - For THIS specific row only, check if house number's Y-axis range OVERLAPS with the person's NAME Y-axis range
+    - The NAME must also fall within the name header X-range
+    - **ROW-LOCAL ASSIGNMENT:**
+      * Evaluate ONLY this specific row
+      * DO NOT look at previous rows
+      * DO NOT look at next rows
+      * DO NOT consider list index or position
+      * DO NOT compensate for missing values in other rows
+    - If NO Y-overlap exists → return "" (empty string)
+    - If multiple house numbers match (header X-range AND Y-overlap) → choose the one with closest X-axis alignment
+    - **CRITICAL: A missing houseNumber in one row MUST NOT affect other rows**
+  - **STEP 4: Extract EXACTLY as seen**
     - Read EXACTLY: if you see "12" → extract "12", if you see "12/3" → extract "12/3", if you see "10-15" → extract "10-15"
     - DO NOT modify, normalize, or clean the house number
     - DO NOT convert formats (e.g., don't change "10-15" to "10" or "15")
     - DO NOT add or remove characters
-  - **CRITICAL RULES:**
-    - DO NOT use house numbers from other rows
-    - DO NOT use numbers from other columns (like order numbers, ID numbers)
-    - DO NOT guess or infer house numbers
-    - DO NOT fill in missing house numbers
-    - If the "บ้านเลขที่" column is empty for this person → return \`null\`
-    - Extract EXACTLY what you see, nothing more, nothing less`;
+  - **ABSOLUTE PROHIBITIONS (NON-PROPAGATION ENFORCED):**
+    - ❌ NEVER assign without Y-axis overlap with NAME
+    - ❌ NEVER assign if value falls outside houseNumber header X-range
+    - ❌ NEVER assign based on X-axis proximity alone (must match header X-range)
+    - ❌ NEVER use house numbers from other rows
+    - ❌ NEVER use numbers from "ลำดับที่" header X-range (orderIndex)
+    - ❌ NEVER move data across headers
+    - ❌ NEVER guess or infer house numbers
+    - ❌ NEVER fill in missing house numbers
+    - ❌ NEVER use orderIndex as houseNumber
+    - ❌ NEVER shift houseNumbers upward or downward between rows
+    - ❌ NEVER reuse a houseNumber for a different row
+    - ❌ NEVER align houseNumbers by list index or position
+    - ❌ NEVER "fill gaps" when a value is missing
+    - ❌ NEVER compensate for missing values in other rows
+    - ❌ NEVER let a missing houseNumber in one row influence other rows
+    - If value does not fall under any header X-range → return "" (empty string)
+    - If no Y-overlap → return "" (empty string, not null)
+    - **CRITICAL: Each row is evaluated in complete isolation**`;
         break;
       case "age":
         description += `Age in years (numeric only)
@@ -1429,16 +1476,25 @@ function buildVisionPrompt(pageNumber, template) {
     return description;
   }).join('\n\n');
   
-  // Build JSON schema example
+  // Build JSON schema example (matches Gemini Web UI format)
+  const recordExample = columns.reduce((acc, col) => {
+    if (col.key === "name") {
+      acc[col.label] = "น.ส.เบญจมาศ ขนบ";
+    } else if (col.key === "address") {
+      acc[col.label] = "10/5";
+    } else {
+      acc[col.label] = null;
+    }
+    return acc;
+  }, {});
+  
   const jsonExample = {
-    page: pageNumber,
-    records: [
-      columns.reduce((acc, col) => {
-        acc[col.label] = col.key === "name" ? "น.ส.เบญจมาศ ขนบ" : 
-                        col.key === "address" ? "10/5" : null;
-        return acc;
-      }, {})
-    ]
+    records: [recordExample],
+    meta: {
+      totalRecords: 1,
+      confidence: "high",
+      notes: ""
+    }
   };
   
   const jsonSchema = JSON.stringify(jsonExample, null, 2);
@@ -1447,138 +1503,716 @@ function buildVisionPrompt(pageNumber, template) {
   const requiredFields = columns.filter(col => col.required).map(col => col.label);
   const optionalFields = columns.filter(col => !col.required).map(col => col.label);
   
-  return `You are a document-vision extraction AI.
+  // Get field labels from template
+  const nameLabel = columns.find(c => c.key === "name")?.label || "ชื่อ-สกุล";
+  const addressLabel = columns.find(c => c.key === "address")?.label || "บ้านเลขที่";
+  
+  return `คุณคือผู้ช่วยอัจฉริยะที่เชี่ยวชาญในการวิเคราะห์ข้อมูลจากตารางในเอกสาร โปรดทำความเข้าใจโครงสร้างตารางและดึงข้อมูลตามคำสั่ง
 
-Your task is to read a Thai official tabular document from this image and extract ONLY real person records.
+**ข้อมูลนำเข้า:**
+คุณจะได้รับภาพ (image) ของเอกสาร PDF ซึ่งมีข้อมูลในรูปแบบตารางอย่างชัดเจน โปรดทราบว่าข้อความที่สกัดมาอาจมีข้อผิดพลาดจากการรู้จำอักขระด้วยแสง (OCR errors) ทำให้ชื่อหรือข้อมูลอื่นๆ อาจมีการสะกดผิดเพี้ยนไปจากต้นฉบับ และบางครั้งข้อมูลคอลัมน์อาจไม่ตรงแถวกัน ทำให้ "เลขหมายประจำบ้าน" อาจไม่ตรงกับ "ชื่อตัว - ชื่อสกุล" ในบางรายการ
 
-The document is a table listing eligible voters or residents.
+**วัตถุประสงค์:**
+วิเคราะห์ข้อมูลตารางในภาพที่ให้มา และดึงเฉพาะข้อมูลจากคอลัมน์ต่อไปนี้:
+1. **"เลขหมายประจำบ้าน"** (House Number)
+2. **"ชื่อตัว - ชื่อสกุล"** (Full Name)
 
-IMPORTANT:
-- This is a structured table.
-- Use visual layout, column alignment, and headers to understand meaning.
-- Ignore OCR noise, decorations, stamps, footnotes, and explanatory text.
+**กฎการดึงและจัดรูปแบบข้อมูล:**
+*   สำหรับแต่ละรายการ (entry) หรือแต่ละแถวเชิงตรรกะในตาราง:
+    *   ให้ดึงค่าจากคอลัมน์ "ชื่อตัว - ชื่อสกุล" เสมอ
+    *   **สำคัญมาก:** ให้ดึงค่าจากคอลัมน์ "เลขหมายประจำบ้าน" **เฉพาะเมื่อมั่นใจว่าเลขหมายนั้นเป็นของบุคคลเดียวกันกับ "ชื่อตัว - ชื่อสกุล" ที่กำลังประมวลผลอยู่ในรายการนั้นๆ เท่านั้น** (อยู่ภายในขอบเขตของแถวหรือรายการเดียวกัน)
+*   ห้ามดึงข้อมูลจากคอลัมน์อื่นๆ นอกเหนือจากที่ระบุ
 
-From the provided image:
+**การจัดการกับชื่อที่ผิดเพี้ยนหรือไม่ชัดเจน:**
+*   **พยายามถอดความจากต้นฉบับ:** หากชื่อในคอลัมน์ "ชื่อตัว - ชื่อสกุล" มีการสะกดผิดเพี้ยนเล็กน้อย (เช่น ตัวอักษรสลับกัน, ตกหล่น) ให้พยายามคาดเดาและถอดความเป็นชื่อที่ใกล้เคียงกับชื่อคนปกติมากที่สุด โดยอ้างอิงจากรูปแบบชื่อทั่วไป และบริบทของข้อมูลในรายการนั้นๆ
+*   **คงเค้าโครงเดิม:** หากการสะกดผิดเพี้ยนรุนแรงจนไม่สามารถถอดความเป็นชื่อที่สมเหตุสมผลได้ แต่ยังพอมีเค้าโครงของตัวอักษรอยู่ ให้คงสภาพของข้อความผิดเพี้ยนนั้นไว้ในผลลัพธ์ โดยไม่พยายามสร้างชื่อใหม่ที่ไม่เกี่ยวข้องกับต้นฉบับ
+*   **ระบุเมื่อไม่สามารถระบุได้:** หากข้อความในส่วนของชื่อนั้นเสียหายอย่างสิ้นเชิงจนไม่สามารถอ่านหรือระบุเค้าโครงใดๆ ได้เลย ให้ใช้ค่า \`"[ชื่อไม่ชัดเจน]"\` สำหรับคีย์ "${nameLabel}" แทน
 
-1. Visually detect the table structure.
-2. Identify the column headers by their visual position (top row of the table).
-3. **CRITICAL: Identify which column contains "บ้านเลขที่" (house number)**
-   - Look for column headers like: "บ้านเลขที่", "เลขที่", "บ้าน", "เลขหมายประจำบ้าน"
-   - The house number column is usually a numeric column (contains numbers like 1, 2, 10, 12/3, etc.)
-   - This column is typically located after the name column
-4. Extract ONLY rows that represent REAL PEOPLE.
+**การจัดการกับข้อมูลที่ไม่สอดคล้องกัน/จับคู่ผิดพลาด:**
+*   **หากพบ "เลขหมายประจำบ้าน" ที่ดูเหมือนจะไม่เป็นของบุคคลในรายการปัจจุบัน (เช่น อยู่ในคอลัมน์เดียวกันแต่ตำแหน่งแนวตั้งไม่ตรงกับชื่อ หรือมีค่าที่ไม่ใช่บ้านเลขที่อยู่ในคอลัมน์บ้านเลขที่):** ให้ละเว้น "เลขหมายประจำบ้าน" นั้น และประมวลผลบุคคลนั้นโดยไม่มีคีย์ "${addressLabel}" ในวัตถุ JSON
+*   **เป้าหมายคือการจับคู่ที่ถูกต้องหรือไม่มีเลย ดีกว่าจับคู่ผิด**
 
-⛔ DO NOT include:
-- Header rows
-- Sub-headers
-- Notes
-- Explanations
-- Footers
-- Stamps
-- Signatures
-- Words like:
-  "ประจำบ้าน", "ลายพิมพ์นิ้วมือ", "หมายเหตุ",
-  "เลขประจำตัวประชาชน", "เลือกตั้ง",
-  "CU", "HOME", English noise, symbols, or stray letters
+**รูปแบบผลลัพธ์ที่ต้องการ (JSON):**
+โปรดส่งคืนผลลัพธ์เป็น JSON object ที่มีโครงสร้างดังนี้:
+{
+  "records": [
+    {
+      "${nameLabel}": "สมชาย ใจดี",
+      "${addressLabel}": "123/45"
+    },
+    {
+      "${nameLabel}": "สุภาพร สุขใจ"
+    },
+    {
+      "${nameLabel}": "มานะ พัฒนา",
+      "${addressLabel}": "50/2"
+    },
+    {
+      "${nameLabel}": "นิดหน่อย รักเรียน"
+    },
+    {
+      "${nameLabel}": "ธรรา สุรพร"
+    },
+    {
+      "${nameLabel}": "[ชื่อไม่ชัดเจน]"
+    },
+    {
+      "${nameLabel}": "วิภาวดี มีสุข"
+    }
+  ]
+}
 
----
+**กฎสำคัญ:**
+*   แต่ละวัตถุจะต้องมีคีย์ "${nameLabel}" ที่เก็บค่าจากคอลัมน์ "ชื่อตัว - ชื่อสกุล" (ที่ผ่านการปรับแก้/คงเค้าโครงตามกฎข้างต้น)
+*   หาก "เลขหมายประจำบ้าน" ถูกดึงมาได้อย่างถูกต้องและมั่นใจว่าเป็นของบุคคลนั้น ให้เพิ่มคีย์ "${addressLabel}" เข้าไปในวัตถุนั้นด้วย และเก็บค่าจากคอลัมน์ "เลขหมายประจำบ้าน"
+*   หาก "เลขหมายประจำบ้าน" ไม่มีค่า หรือไม่สามารถจับคู่ได้อย่างถูกต้องตามกฎข้างต้น **ไม่ต้อง**เพิ่มคีย์ "${addressLabel}" ในวัตถุนั้น
 
-## 🎯 TARGET FIELDS (STRICT)
+**รูปแบบผลลัพธ์:**
+- Output ต้องเป็น JSON เท่านั้น
+- ห้ามมี markdown code block
+- ห้ามมีคำอธิบายหรือ comment
+- ห้ามมีข้อความอื่นนอกเหนือจาก JSON
 
-Extract ONLY these fields:
+Return ONLY the JSON object.
+No explanations. No markdown. No additional text.`;
+}
 
-${fieldDescriptions}
+/**
 
-${requiredFields.length > 0 ? `\n**REQUIRED FIELDS (must extract):**\n${requiredFields.map(f => `- ${f}`).join('\n')}` : ''}
-${optionalFields.length > 0 ? `\n**OPTIONAL FIELDS (return null if missing):**\n${optionalFields.map(f => `- ${f}`).join('\n')}` : ''}
+2. **COLUMNS AND HEADERS (HEADER LOCK RULE - MANDATORY)**
+   - **STEP 1: Detect the table header row visually**
+     * Identify the header row at the top of the table
+     * Headers are FIXED SEMANTIC ANCHORS that define column meaning
+   - **STEP 2: Identify each column header text**
+     * Read each header text exactly as seen
+     * Common headers:
+       - "เลขหมายประจำบ้าน" → houseNumber column
+       - "ลำดับที่" → orderIndex column (row index, NOT houseNumber)
+       - "ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล" → name column
+       - "บ้านเลขที่", "เลขที่", "บ้าน" → houseNumber column
+   - **STEP 3: Lock the X-axis range of each header**
+     * For each header, record its X-axis boundaries (left X, right X)
+     * This X-range defines which data cells belong to this header
+     * Headers are AUTHORITATIVE - data MUST obey headers
+   - **STEP 4: Assign data cells ONLY to matching header X-range**
+     * A data cell may ONLY be assigned to a field if:
+       * It falls within that header's X-axis range
+       * It has Y-axis overlap with a NAME row (for dependent fields)
+     * NEVER move data across headers
+     * NEVER assign data to a field if it falls outside that header's X-range
 
----
+3. **NAME DETECTION (ROW ANCHOR) - CRITICAL FIRST STEP (SOFT MODE)**
+   - **DETECT ALL NAME ELEMENTS FIRST**
+   - **CRITICAL: PERSON NAMES are the PRIMARY SOURCE OF TRUTH**
+   - Detect ALL visible person names under the name column header
+   - A name MUST be kept if it is visually readable, even if:
+     * X-axis alignment is slightly off
+     * The name spans multiple lines
+     * The row height differs from others
+     * Neighboring columns are noisy
+   - For each detected NAME, record its Y-axis range (vertical position)
+   - **A row EXISTS if a NAME exists** (even if ALL dependent fields are empty)
+   - No NAME = no row
+   - Map each NAME to its vertical Y-range (row window)
+   - This Y-range defines the row boundary for ALL dependent fields
+   - **MULTI-LINE NAME RULE:**
+     * If a name spans multiple visual lines → merge those lines into ONE name field
+     * Preserve original order and spacing
+     * Extract EXACTLY as seen across all lines
 
-## 📐 ROW RULES (VERY IMPORTANT)
+4. **ROW BOUNDARIES (NAME-ANCHORED)**
+   - Row boundaries are defined by NAME Y-axis ranges
+   - Each NAME creates ONE row window
+   - All other fields (houseNumber, address, etc.) are DEPENDENT fields
+   - Dependent fields can ONLY be assigned if their Y-range overlaps with a NAME's Y-range
 
-- One table row = one person
+5. **CELL-LEVEL CONTENT**
+   - Extract text from each cell within its row/column intersection
+   - Preserve multi-line text within the same cell
+   - Extract EXACTLY as seen (no modification)
+
+=====================================================
+INPUT GUARANTEE
+=====================================================
+
+- The list of names is FINAL and CORRECT (once detected from the image)
+- Each name represents ONE row
+- You are NOT allowed to create or delete rows
+- Names define the rows - they are AUTHORITATIVE
+
+=====================================================
+TASK
+=====================================================
+
+For EACH detected name:
+- Try to find a matching house number from the image
+- Use visual alignment ONLY
+- If unsure, leave houseNumber empty
+
+=====================================================
+ROW ANCHOR STRATEGY (CRITICAL - MANDATORY)
+=====================================================
+
+**CORE CONCEPT: NAME IS THE ROW ANCHOR (PRIMARY SOURCE OF TRUTH)**
+
+- The NAME field is the ROW ANCHOR and PRIMARY SOURCE OF TRUTH
+- A row exists ONLY where a NAME exists
+- **A row EXISTS if a NAME exists (even if ALL dependent fields are empty)**
+- All other fields (houseNumber, address, etc.) are DEPENDENT fields
+- No NAME = no row
+- No Y-overlap with NAME = no assignment for dependent fields
+- **NAME PRESERVATION OVERRIDE: Never drop a row with a valid name, even if dependent fields are empty**
+
+**MANDATORY ROW LOCK RULE:**
+
+This document contains visually dense numeric fields with TWO semantic roles (houseNumber and orderIndex).
+
+Apply the following rules STRICTLY:
+
+1. **DETECT ALL NAME ELEMENTS FIRST (SOFT MODE - NAME PRESERVATION)**
+   - Identify every NAME in the document under the name column header
+   - **CRITICAL: A name MUST be kept if it is visually readable, even if:**
+     * X-axis alignment is slightly off
+     * The name spans multiple lines
+     * The row height differs from others
+     * Neighboring columns are noisy
+   - **MULTI-LINE NAME RULE:** If a name spans multiple visual lines → merge into ONE name field
+   - For each NAME, define its vertical Y-axis range (row window)
+   - Record the Y-range boundaries (top Y, bottom Y)
+   - Record the NAME's X-axis position (to determine LEFT vs RIGHT)
+   - **NEVER discard a name due to minor alignment issues**
+
+2. **FOR EACH NAME, DEFINE A ROW WINDOW**
+   - The NAME's Y-axis range defines the row boundary
+   - This is the ONLY valid row window for dependent fields
+
+3. **HEADER-BASED NUMERIC FIELD DISAMBIGUATION (CRITICAL)**
+   - Detect table headers and lock X-axis ranges for each header
+   - Classify numeric values by which header's X-range they fall under:
+     * Falls under "เลขหมายประจำบ้าน" or "บ้านเลขที่" header X-range → houseNumber
+     * Falls under "ลำดับที่" header X-range → orderIndex (IGNORE for houseNumber)
+     * Does NOT fall under any header X-range → IGNORE
+   - houseNumber must fall within houseNumber header X-range
+   - Any numeric value under "ลำดับที่" header X-range is orderIndex (NOT houseNumber)
+   - If value does not fall under any header X-range → leave houseNumber as ""
+   - Header X-range alignment OVERRIDES position rules
+
+4. **DEPENDENT FIELD ASSIGNMENT RULE (HEADER-LOCKED)**
+   - A houseNumber may ONLY be assigned if:
+     * It falls within the houseNumber header X-range ("เลขหมายประจำบ้าน" or "บ้านเลขที่" etc.)
+     * Its Y-axis range OVERLAPS with a NAME's Y-axis range
+     * The NAME falls within the name header X-range
+   - If no Y-overlap exists → field MUST be "" (empty string)
+   - If value falls outside houseNumber header X-range → IGNORE it (it's not houseNumber)
+   - If value falls within "ลำดับที่" header X-range → IGNORE it (it's orderIndex)
+   - Header X-range alignment is MANDATORY - data MUST obey headers
+
+**ABSOLUTE PROHIBITIONS:**
+❌ NEVER assign houseNumber based on X-axis proximity alone
+❌ NEVER choose the "nearest" number without Y-overlap verification
+❌ NEVER merge house numbers across rows
+❌ NEVER guess missing house numbers
+❌ NEVER assign a houseNumber to a row without a NAME
+
+=====================================================
+SPATIAL ALIGNMENT RULES (CRITICAL)
+=====================================================
+
+**PRIMARY RULE: Y-AXIS OVERLAP WITH NAME (ROW ANCHOR)**
+- Use NAME Y-axis range as the PRIMARY anchor for row grouping
+- A field belongs to a row ONLY if its Y-axis range OVERLAPS with that row's NAME Y-axis range
+- If Y-axis ranges do NOT overlap → they belong to DIFFERENT rows
+- If no Y-overlap with any NAME → field MUST be "" (empty)
+
+**SECONDARY RULE: X-AXIS (HORIZONTAL) FOR COLUMN ASSIGNMENT**
+- Use horizontal position (X-axis) ONLY to determine which column a field belongs to
+- Match each field to its column based on X-axis alignment with the header
+- For houseNumber: Must be in the "บ้านเลขที่" column AND have Y-overlap with NAME
+
+**MULTIPLE MATCH HANDLING:**
+- If MORE THAN ONE houseNumber overlaps the same NAME row:
+  * Choose ONLY the one with the closest X-axis alignment to the "บ้านเลขที่" column
+  * Discard all others
+  * If X-axis alignment is equal → choose the one with the strongest Y-overlap
+
+**ALIGNMENT DECISION TREE:**
+1. Does the field have Y-axis overlap with a NAME's Y-range? → YES: proceed to step 2 | NO: field = ""
+2. Is the field in the correct column (X-axis match)? → YES: assign to that NAME's row | NO: field = ""
+3. If alignment is ambiguous → leave the field empty ("") or use null
+4. If multiple matches exist → choose closest X-axis alignment
+
+❌ NEVER guess alignment
+❌ NEVER merge fields across rows
+❌ NEVER infer missing data from other rows
+❌ NEVER assign without Y-overlap verification
+
+=====================================================
+CRITICAL NAME PRESERVATION RULE (NON-NEGOTIABLE)
+=====================================================
+
+**PERSON NAMES are the PRIMARY SOURCE OF TRUTH.**
+
+The system MUST prioritize preserving ALL detected names,
+even if layout alignment is imperfect.
+
+**NAME HANDLING RULES (SOFT MODE):**
+
+- Detect ALL visible person names under the name column header
+- A name MUST be kept if it is visually readable, even if:
+  * X-axis alignment is slightly off
+  * The name spans multiple lines
+  * The row height differs from others
+  * Neighboring columns are noisy
+
+❌ NEVER discard a name due to minor alignment issues
+❌ NEVER drop a row solely because dependent fields are ambiguous
+
+**MULTI-LINE NAME RULE:**
+- If a name spans multiple visual lines:
+  * Merge those lines into ONE name field
+  * Preserve original order and spacing
+  * Extract EXACTLY as seen across all lines
+
+**ROW EXISTENCE RULE (REVISED):**
+- A row EXISTS if a NAME exists
+- Even if ALL dependent fields (houseNumber, address, etc.) are empty or invalid,
+  the row MUST still be output
+- Dependent field failure is NOT row failure
+
+**DEPENDENT FIELD FAILURE IS NOT ROW FAILURE:**
+- If dependent fields cannot be confidently assigned:
+  → leave those fields empty ("")
+  → DO NOT remove the name or the row
+
+**FINAL SAFETY OVERRIDE:**
+- It is ALWAYS better to output:
+  * A row with only a name
+- than:
+  * Dropping a valid person entirely
+
+=====================================================
+ROW INTEGRITY RULES (NON-NEGOTIABLE)
+=====================================================
+
+**ONE ROW = ONE PERSON = ONE RECORD**
+
+- Preserve ROW INTEGRITY at all costs
+- One table row = one person record
 - NEVER merge two people into one record
 - NEVER split one person into multiple records
-- NEVER drop rows
+- NEVER drop valid rows (especially rows with names)
 - Preserve visual row order from top to bottom
-- If a row does NOT clearly represent a person → SKIP it
-- If a required field is missing → use \`null\` (do NOT skip the row)
 
-## 🏠 HOUSE NUMBER EXTRACTION (CRITICAL RULES)
+**ROW VALIDATION (NAME-PRIORITIZED):**
+- If a NAME exists → the row MUST be output (even if all dependent fields are empty)
+- If a row does NOT clearly represent a person (no readable name) → SKIP it
+- If a row is partially unreadable → keep the row, leave unreadable fields empty ("" or null)
+- If a required field is missing → use null (do NOT skip the row)
+- If dependent fields are ambiguous → leave them empty, but KEEP the name and row
+
+=====================================================
+TABLE & FIELD HANDLING
+=====================================================
+
+**TABLE DETECTION:**
+- Detect tables even if:
+  * No visible grid lines
+  * Uneven spacing
+  * Scanned/photographed documents
+  * Handwritten annotations
+- Column headers may appear only once at the top
+- Headers may span multiple visual lines → treat as one header row
+
+**MULTI-LINE CELL RULE:**
+- If text fragments share the same X-range AND Y-range → they are the SAME cell
+- If Y-range differs significantly → they are DIFFERENT rows
+- Example: If a name wraps to 2 lines within the same cell → extract as one value
+
+**FIELD EXTRACTION:**
+${fieldDescriptions}
+
+${requiredFields.length > 0 ? `\n**REQUIRED FIELDS (must extract, use null if missing):**\n${requiredFields.map(f => `- ${f}`).join('\n')}` : ''}
+${optionalFields.length > 0 ? `\n**OPTIONAL FIELDS (return null if missing):**\n${optionalFields.map(f => `- ${f}`).join('\n')}` : ''}
+
+=====================================================
+LANGUAGE & NORMALIZATION (THAI-SAFE)
+=====================================================
+
+- Preserve original Thai text EXACTLY as seen
+- DO NOT autocorrect spelling
+- DO NOT normalize names
+- DO NOT remove gender markers ("นาย", "นาง", "น.ส.", "น.ส")
+- DO NOT modify spacing or formatting
+- Remove ONLY obvious OCR artifacts (random symbols, stray characters)
+- Remove "/" symbol ONLY if it appears at the VERY START (e.g., "/ ชื่อ" → "ชื่อ")
+
+**EXTRACTION EXAMPLES:**
+- If you see "นายสมชาย ใจดี" → extract "นายสมชาย ใจดี" (exactly)
+- If you see "น.ส.เบญจมาศ ขนบ" → extract "น.ส.เบญจมาศ ขนบ" (exactly)
+- If you see "12/3" → extract "12/3" (exactly, not "12" or "3")
+- If you see "10-15" → extract "10-15" (exactly, do NOT split into "10" and "15")
+
+=====================================================
+CRITICAL HEADER LOCK RULE (NON-NEGOTIABLE)
+=====================================================
+
+This document contains CLEAR TABLE HEADERS.
+These headers MUST be treated as FIXED SEMANTIC ANCHORS.
+
+**THE TABLE HEADERS DEFINE THE MEANING OF EACH COLUMN.**
+**ALL DATA EXTRACTION MUST STRICTLY FOLLOW THE HEADERS.**
+
+The model MUST perform these steps IN ORDER:
+
+1) **Detect the table header row visually**
+   - Identify the header row at the top of the table
+   - Headers are FIXED SEMANTIC ANCHORS
+
+2) **Identify each column header text**
+   - Read each header text exactly as seen
+   - Map headers to their semantic meaning:
+     * "เลขหมายประจำบ้าน" → houseNumber
+     * "ลำดับที่" → orderIndex (row index, NOT houseNumber)
+     * "ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล" → name
+     * "บ้านเลขที่", "เลขที่", "บ้าน" → houseNumber
+
+3) **Lock the X-axis range of each header**
+   - For each header, record its X-axis boundaries (left X, right X)
+   - This X-range defines which data cells belong to this header
+   - Headers are AUTHORITATIVE - data MUST obey headers
+
+4) **Assign ALL data cells ONLY to the header whose X-range they fall under**
+   - A data cell may ONLY be assigned to a field if it falls within that header's X-axis range
+   - NEVER move data across headers
+   - NEVER assign data to a field if it falls outside that header's X-range
+
+**HEADER DEFINITIONS (STRICT):**
+- "เลขหมายประจำบ้าน" → houseNumber
+- "ลำดับที่" → orderIndex (row index, NOT houseNumber)
+- "ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล" → name
+- Any numeric data under "ลำดับที่" header → orderIndex ONLY (NOT houseNumber)
+- Any numeric data under "เลขหมายประจำบ้าน" or "บ้านเลขที่" header → houseNumber
+
+**ABSOLUTE PROHIBITIONS:**
+❌ NEVER move data across headers
+❌ NEVER infer column meaning from data shape alone
+❌ NEVER assign numeric values to a field if they fall outside that header's X-range
+❌ NEVER use data from "ลำดับที่" header as houseNumber
+
+**HEADER ALIGNMENT OVERRIDES:**
+Header alignment OVERRIDES:
+- Y-axis proximity
+- Visual similarity
+- Numeric similarity
+- Sequential patterns
+- X-axis proximity (if outside header X-range)
+
+**ROW ANCHOR (REINFORCED WITH HEADER LOCK):**
+- A row exists ONLY if a NAME exists under the "ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล" header
+- All dependent fields (houseNumber, etc.) must be aligned BOTH:
+  a) Vertically with the name (Y-axis overlap)
+  b) Horizontally under the correct header (within header X-range)
+
+**FAIL-SAFE MODE:**
+- If a value does not clearly fall under any header's X-range:
+  → leave the field empty ("")
+- If header detection is unclear:
+  → prioritize header text over data patterns
+  → leave fields empty rather than guess
+
+**FINAL DIRECTIVE:**
+Table headers are authoritative.
+Data MUST obey headers, not vice versa.
+
+=====================================================
+CRITICAL NUMERIC FIELD DISAMBIGUATION (MUST APPLY)
+=====================================================
+
+This document contains MULTIPLE NUMERIC COLUMNS that MUST NOT be mixed.
+
+There are TWO DIFFERENT numeric roles:
+
+**1) houseNumber (บ้านเลขที่ / เลขหมายประจำบ้าน)**
+- Defined by header: "เลขหมายประจำบ้าน" or "บ้านเลขที่" or "เลขที่" or "บ้าน"
+- Data cells must fall within this header's X-axis range
+- NOT guaranteed to be sequential
+- Belongs to the PERSON RECORD
+- DEPENDENT on name row alignment (Y-axis overlap) AND header X-range
+
+**2) orderIndex (ลำดับที่ / row index)**
+- Defined by header: "ลำดับที่"
+- Data cells must fall within this header's X-axis range
+- STRICTLY sequential (1, 2, 3, 4, ...)
+- Used ONLY as a row index/counter
+- MUST NOT be used as houseNumber
+- Any numeric data under "ลำดับที่" header → orderIndex ONLY
+
+**ABSOLUTE PROHIBITIONS:**
+❌ NEVER use orderIndex as houseNumber
+❌ NEVER merge numeric values from different semantic roles
+❌ NEVER assume all vertical numbers belong to the same field
+❌ NEVER use sequential numbers (1,2,3...) as houseNumber if they appear RIGHT of name
+
+**SEMANTIC ROLE PRIORITY:**
+Semantic role correctness OVERRIDES:
+- X-axis proximity
+- Y-axis proximity
+- Visual similarity
+- Numeric similarity
+
+**FINAL SAFETY RULE:**
+If a numeric value could plausibly be either houseNumber OR orderIndex:
+→ treat it as orderIndex
+→ DO NOT assign it as houseNumber
+→ leave houseNumber as "" (empty string)
+
+**HEADER-BASED RULE (CRITICAL):**
+- houseNumber must be under "เลขหมายประจำบ้าน" or "บ้านเลขที่" or "เลขที่" or "บ้าน" header
+- orderIndex must be under "ลำดับที่" header
+- Any numeric value under "ลำดับที่" header → orderIndex ONLY (NOT houseNumber)
+- If a value does not fall under any header's X-range → leave field empty ("")
+- Header X-range alignment OVERRIDES position rules
+
+=====================================================
+STRICT NON-PROPAGATION RULE
+=====================================================
+
+- Each row is evaluated independently.
+- Failure on one row MUST NOT affect any other row.
+- NEVER shift values up or down.
+- NEVER reuse a value for another row.
+
+**ROW-LOCAL ASSIGNMENT ONLY:**
+
+For EACH row (defined by NAME):
+- Attempt to find a houseNumber that:
+  a) Visually aligns vertically (Y-axis) with the NAME
+  b) Appears under the house-number column (houseNumber header X-range)
+  c) Looks like a real house number (e.g., 9, 10, 13/1)
+
+- If ANY condition fails → houseNumber = ""
+- If NO valid houseNumber is found → houseNumber = ""
+
+DO NOT look at previous or next rows.
+DO NOT compensate for missing values.
+
+**NO CASCADE GUARANTEE:**
+
+A missing or invalid houseNumber in row N
+MUST NOT influence row N+1 or row N-1.
+
+Rows are ISOLATED.
+Each row stands alone.
+
+**FINAL SAFETY RULE:**
+
+Correct isolation is more important than completeness.
+
+One empty houseNumber is acceptable.
+One shifted houseNumber corrupts the entire dataset.
+
+=====================================================
+HOUSE NUMBER EXTRACTION (CRITICAL - ROW-LOCKED)
+=====================================================
 
 For the "บ้านเลขที่" (house number) field:
 
-**RULE 1 - SAME ROW ONLY:**
-- Extract house number ONLY from the SAME row as the person's name
-- The house number MUST be in the same visual row as the person
-- DO NOT use house numbers from adjacent rows
-- DO NOT use house numbers from the row above or below
+**PRE-EXTRACTION: INTERNAL REASONING (DO NOT OUTPUT - NON-PROPAGATING)**
+Before producing the final JSON, you MUST internally:
+1. Detect the table header row and identify all headers
+2. Lock the X-axis range for each header:
+   - "เลขหมายประจำบ้าน" or "บ้านเลขที่" or "เลขที่" or "บ้าน" → houseNumber header X-range
+   - "ลำดับที่" → orderIndex header X-range (IGNORE for houseNumber)
+   - "ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล" → name header X-range
+3. Map all detected NAME elements with their Y-axis ranges (must be under name header X-range)
+4. Map all numeric values and classify by header X-range:
+   - Values under "เลขหมายประจำบ้าน" or "บ้านเลขที่" header X-range → houseNumber candidates
+   - Values under "ลำดับที่" header X-range → orderIndex (IGNORE, do NOT use)
+5. **CRITICAL: For EACH NAME (evaluated independently, one at a time):**
+   - Find houseNumber candidates that:
+     * Fall within houseNumber header X-range
+     * Have Y-axis OVERLAP with THIS specific NAME
+   - **DO NOT consider other rows**
+   - If NO match found → houseNumber = "" (for THIS row only)
+   - If ONE match found → assign to THIS row only
+   - If MULTIPLE matches found → choose closest X-axis alignment (for THIS row only)
+6. **NON-PROPAGATION ENFORCEMENT:**
+   - Each row is evaluated in complete isolation
+   - A missing houseNumber in row N does NOT affect row N+1 or N-1
+   - DO NOT shift, reuse, or align houseNumbers between rows
+   - DO NOT compensate for missing values
 
-**RULE 2 - NO GUESSING:**
-- If a person's row does NOT have a house number → return \`null\`
-- DO NOT guess or infer house numbers
-- DO NOT copy house numbers from other people
-- DO NOT fill in missing house numbers
+This reasoning is INTERNAL ONLY and must NOT appear in output.
 
-**RULE 3 - COLUMN IDENTIFICATION & EXACT EXTRACTION:**
-- **FIRST STEP: Identify the "บ้านเลขที่" column**
-  - Look for column header: "บ้านเลขที่", "เลขที่", "บ้าน", "เลขหมายประจำบ้าน"
-  - This column contains numeric values (house numbers)
-  - It is typically located after the name column
-  - Remember which column position this is (e.g., 3rd column, 4th column)
-- **SECOND STEP: Extract EXACTLY as seen from the identified column**
-  - For each person row, read ONLY from the "บ้านเลขที่" column you identified
-  - Extract EXACTLY what you see: if you see "12" → extract "12", if you see "12/3" → extract "12/3", if you see "10-15" → extract "10-15"
-  - DO NOT modify, normalize, or clean the value
-  - DO NOT convert formats (e.g., don't change "10-15" to "10" or "15")
-  - DO NOT add or remove characters
-  - DO NOT read from other columns (order numbers, ID numbers, etc.)
-  - If the "บ้านเลขที่" column is empty for this person → return \`null\`
-  - **CRITICAL: Extract EXACTLY as seen, nothing more, nothing less**
+**STEP 1: HEADER DETECTION & X-AXIS LOCKING**
+- Detect the table header row visually
+- Identify each column header text exactly as seen
+- Lock the X-axis range (left X, right X) for each header:
+  * "เลขหมายประจำบ้าน" or "บ้านเลขที่" or "เลขที่" or "บ้าน" → houseNumber header X-range
+  * "ลำดับที่" → orderIndex header X-range (MARK as IGNORE for houseNumber)
+  * "ชื่อตัว - ชื่อสกุล" or "ชื่อ-สกุล" → name header X-range
+- **CRITICAL: Headers are FIXED SEMANTIC ANCHORS - data MUST obey headers**
 
-**RULE 4 - ACCURACY:**
-- Each person's house number must be correct for that specific person
-- One person = one row = one house number (or null if missing)
-- Never mix house numbers between different people
+**STEP 2: NAME ANCHOR DETECTION**
+- Detect ALL NAME elements first
+- For each NAME, record its Y-axis range (top Y, bottom Y)
+- Record the NAME's X-axis position (to determine LEFT vs RIGHT)
+- This Y-range defines the row window for that person
 
----
+**STEP 3: HEADER-BASED NUMERIC FIELD DISAMBIGUATION (MANDATORY)**
+- For each numeric value detected, check which header's X-range it falls under:
+  * If it falls under "เลขหมายประจำบ้าน" or "บ้านเลขที่" or "เลขที่" or "บ้าน" header X-range → houseNumber candidate
+  * If it falls under "ลำดับที่" header X-range → orderIndex (IGNORE, do NOT use as houseNumber)
+  * If it does NOT fall under any header's X-range → IGNORE (do NOT use)
+- **CRITICAL: Only consider numeric values that fall within houseNumber header X-range**
+- **CRITICAL: Discard all numeric values from "ลำดับที่" header X-range (orderIndex)**
+- Header X-range alignment OVERRIDES position rules (LEFT vs RIGHT)
 
-## 📦 OUTPUT FORMAT (STRICT JSON ONLY)
+**STEP 4: HOUSE NUMBER Y-OVERLAP + HEADER X-RANGE VERIFICATION (MANDATORY - ROW-LOCAL)**
+- **CRITICAL: You are assigning house numbers to EXISTING rows (names). Evaluate EACH row independently.**
+- **HOUSE NUMBER CONDITIONS (ALL MUST BE MET):**
+  A houseNumber may be assigned ONLY if:
+  1) It visually aligns vertically (Y-axis) with the name
+  2) It appears under the house-number column (houseNumber header X-range)
+  3) It looks like a real house number (e.g., 9, 10, 13/1)
+  
+  If ANY condition fails → houseNumber = ""
+  
+- For EACH NAME row (one at a time, in isolation), search for houseNumber candidates that:
+  1. Visually align vertically (Y-axis) with the NAME (Y-axis range OVERLAPS)
+  2. Appear under the house-number column (fall within houseNumber header X-range)
+  3. Look like a real house number (match valid patterns, not sequential indices)
+  4. The NAME must also fall within the name header X-range
+- **ROW-LOCAL ASSIGNMENT:**
+  * Evaluate ONLY this specific row
+  * DO NOT look at previous rows
+  * DO NOT look at next rows
+  * DO NOT consider list index or position
+  * DO NOT compensate for missing values in other rows
+  * Use visual alignment ONLY
+- If NO houseNumber candidate matches ALL 3 conditions → houseNumber = "" (empty string)
+- If ONE houseNumber candidate matches ALL 3 conditions → assign it to that NAME's row
+- If MULTIPLE houseNumber candidates match ALL 3 conditions → choose the one with closest X-axis alignment to the houseNumber header center
+- **CRITICAL: A missing houseNumber in one row MUST NOT affect other rows**
 
-Return ONLY valid JSON.
-No markdown.
-No explanation.
-No comments.
+**STEP 5: EXTRACTION (EXACT AS SEEN)**
+- Extract EXACTLY as seen: "12" → "12", "12/3" → "12/3", "10-15" → "10-15"
+- DO NOT modify, normalize, or clean the house number
 
-Schema:
+**ABSOLUTE PROHIBITIONS:**
+❌ NEVER infer missing values
+❌ NEVER compensate for gaps
+❌ NEVER change name order
+❌ NEVER return fewer or more rows than detected names
+❌ NEVER assign houseNumber without Y-axis overlap with NAME
+❌ NEVER assign houseNumber if it falls outside houseNumber header X-range
+❌ NEVER assign based on X-axis proximity alone (must match header X-range)
+❌ NEVER use house numbers from other rows
+❌ NEVER use numbers from "ลำดับที่" header X-range (orderIndex)
+❌ NEVER move data across headers
+❌ NEVER guess or infer house numbers
+❌ NEVER fill in missing house numbers
+❌ NEVER use orderIndex as houseNumber
+❌ NEVER assign data to a field if it falls outside that header's X-range
+❌ NEVER shift houseNumbers upward or downward between rows
+❌ NEVER reuse a houseNumber for a different row
+❌ NEVER align houseNumbers by list index or position
+❌ NEVER "fill gaps" when a value is missing
+❌ NEVER compensate for missing values in other rows
+❌ NEVER let a missing houseNumber in one row influence other rows
+
+**FAIL-SAFE MODE (NON-PROPAGATION ENFORCED):**
+- If row alignment is unclear, noisy, or ambiguous:
+  * Prioritize ROW CORRECTNESS over data completeness
+  * Leave houseNumber empty ("") rather than risk misalignment
+  * Correct empty fields are FAR BETTER than incorrect data
+  * **CRITICAL: This failure MUST NOT affect other rows**
+- If numeric role is ambiguous (could be houseNumber OR orderIndex):
+  * Treat as orderIndex
+  * DO NOT assign as houseNumber
+  * Leave houseNumber as "" (empty string)
+  * **CRITICAL: This failure MUST NOT affect other rows**
+- **NON-PROPAGATION GUARANTEE:**
+  * Each row is evaluated in complete isolation
+  * A missing houseNumber in row N does NOT affect row N+1 or N-1
+  * One empty houseNumber is acceptable
+  * One shifted houseNumber corrupts the entire dataset
+
+=====================================================
+OUTPUT RULES (STRICT)
+=====================================================
+
+- Output MUST be valid JSON only
+- DO NOT include markdown
+- DO NOT include explanations
+- DO NOT include confidence scores
+- DO NOT include comments
+- DO NOT include additional text
+
+**OUTPUT SCHEMA:**
 
 ${jsonSchema}
 
----
+=====================================================
+ERROR & EDGE CASE HANDLING
+=====================================================
 
-## 🚨 VALIDATION RULES (STRICT - NO GUESSING)
+- If a page contains no usable table → return records = []
+- If a row is partially unreadable → keep row, leave unreadable fields empty ("")
+- If layout is inconsistent → prioritize row separation over completeness
+- If alignment is ambiguous → leave field empty ("") or use null
+- If a value is unclear → use null
+- **If a NAME exists but dependent fields are ambiguous → KEEP the row with name, leave dependent fields empty ("")**
+- **If no NAME exists for a potential row → SKIP the row entirely**
+- **If houseNumber Y-overlap is unclear → leave empty (""), but KEEP the name and row**
+- **NAME PRESERVATION OVERRIDE:**
+  * If a name is readable → ALWAYS output the row (even if all dependent fields are empty)
+  * It is ALWAYS better to output a row with only a name than dropping a valid person
+  * Never drop a row solely because dependent fields are ambiguous
 
-- **EXTRACTION RULE: Extract EXACTLY as seen, NO modification**
-  - Read text EXACTLY as it appears in the document
-  - DO NOT normalize, clean, or fix OCR errors
-  - DO NOT add or remove characters
-  - DO NOT modify spacing or formatting
-  - If you see "นายสมชาย ใจดี" → extract "นายสมชาย ใจดี" (exactly)
-  - If you see "12/3" → extract "12/3" (exactly, not "12" or "3")
+=====================================================
+QUALITY BAR (NON-NEGOTIABLE)
+=====================================================
 
-- **MISSING VALUE RULE:**
-  - If a value is unclear → use null
-  - If a row is ambiguous → SKIP the row
-  - DO NOT hallucinate missing people
-  - DO NOT guess missing values
-  - DO NOT fill in empty fields
-  - DO NOT infer or assume values
+The result must be clean enough to:
+- Convert directly to Excel
+- Require ZERO manual row correction
+- Match Gemini Web UI behavior in accuracy and alignment
+- Preserve ALL detected person names (NAME PRESERVATION RULE)
 
-- **QUALITY RULE:**
-  - DO NOT add extra columns not in the template
-  - Quality > quantity
-  - Preserve all rows (use null for missing values)
-  - Accuracy > completeness
+**DECISION RULE:**
+If unsure between correctness and completeness:
+→ ALWAYS choose correctness
+→ Correct empty fields are FAR BETTER than incorrect data
+→ **NAME PRESERVATION OVERRIDES: It is ALWAYS better to output a row with only a name than dropping a valid person**
+
+**VALIDATION CHECKLIST:**
+- ✅ ALL detected person names are preserved (no names dropped)
+- ✅ All rows are properly separated (no merging)
+- ✅ All fields are correctly aligned to their rows (Y-overlap verified)
+- ✅ House numbers are ONLY assigned to rows with Y-overlap with NAME
+- ✅ Text is extracted exactly as seen (no modification)
+- ✅ Missing values are "" or null (not guessed)
+- ✅ Output is valid JSON (no markdown)
+- ✅ Row correctness is the highest priority
+- ✅ Names are preserved even if dependent fields are empty
+- ✅ Multi-line names are merged into one field
+
+=====================================================
+FINAL DIRECTIVE
+=====================================================
+
+You are NOT an OCR engine.
+You are a ROW-LOCKED DOCUMENT UNDERSTANDING SYSTEM.
+
+**Row correctness is the highest priority.**
+
+- NAME is the row anchor. No NAME = no row.
+- House numbers require Y-axis overlap with NAME.
+- Never assign without Y-overlap verification.
+- Empty fields are better than incorrect assignments.
+
+Analyze visually. Think spatially. Preserve integrity. Lock rows to names.
 
 Return ONLY the JSON object.
 No explanations. No markdown. No additional text.`;
@@ -2617,6 +3251,13 @@ exports.smartOcrVisionPdf = onRequest(
           mode: "vision",
           totalPages: pages.length,
           totalRecords: finalRecords.length,
+          progress: {
+            stage: "completed",
+            currentPage: pages.length,
+            totalPages: pages.length,
+            message: `ประมวลผลเสร็จสิ้น: ${pages.length} หน้า, ${finalRecords.length} รายการ`,
+            percentage: 100,
+          },
         };
         
         // Add Vision credit metadata if credit was deducted

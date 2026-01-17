@@ -339,6 +339,7 @@ export async function smartOcrVisionPdf(
         mode: data.mode || "vision",
         pages: data.totalPages || 0,
         totalRecords: data.totalRecords || 0,
+        progress: data.meta?.progress || null, // Include progress if available
         ...(data.meta || {}),
       },
     }

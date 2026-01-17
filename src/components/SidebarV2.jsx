@@ -10,7 +10,6 @@ import {
   Button,
 } from "@mui/material"
 import SettingsIcon from "@mui/icons-material/Settings"
-import DescriptionIcon from "@mui/icons-material/Description"
 import LogoutIcon from "@mui/icons-material/Logout"
 import { auth } from "../firebase"
 
@@ -21,7 +20,6 @@ export default function SidebarV2({ page, onNavigate, credits, onLogout }) {
   const user = auth.currentUser
 
   const menu = [
-    { key: "template-settings", label: "Document Template Settings", icon: <DescriptionIcon /> },
     { key: "settings", label: "Settings", icon: <SettingsIcon /> },
   ]
 
