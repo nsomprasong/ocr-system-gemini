@@ -122,65 +122,192 @@ async function generateGeminiText(prompt, options = {}) {
  * @returns {Promise<string>} Generated text response
  */
 async function generateGeminiVision(imageBuffer, prompt, options = {}) {
-  try {
-    // Initialize Gemini client
-    const client = initializeGeminiClient();
+  // If disableRetry is true, set maxRetries to 0 (no retries for normal errors)
+  // But MAX_TOKENS errors will still retry with increased tokens (special case)
+  const maxRetries = options.disableRetry ? 0 : (options.maxRetries !== undefined ? options.maxRetries : 2); // Default 2 retries
+  const retryDelay = options.retryDelay || 1000; // Default 1 second delay
+  
+  // Track if we've done a MAX_TOKENS retry (allows one extra retry for MAX_TOKENS even if disableRetry is true)
+  let maxTokensRetryDone = false;
+  let effectiveMaxRetries = maxRetries; // Will be increased if MAX_TOKENS occurs
+  
+  for (let attempt = 0; attempt <= effectiveMaxRetries; attempt++) {
+    try {
+      // Initialize Gemini client
+      const client = initializeGeminiClient();
 
-    // Get model
-    const model = client.getGenerativeModel({
-      model: MODEL_NAME,
-      generationConfig: {
-        maxOutputTokens: options.maxOutputTokens || 8192,
-        temperature: options.temperature !== undefined ? options.temperature : 0,
-      },
-    });
-
-    // Convert image buffer to base64
-    const imageBase64 = imageBuffer.toString('base64');
-    
-    // Detect MIME type from buffer signature
-    let mimeType = 'image/png'; // Default
-    if (imageBuffer.length >= 4) {
-      // PNG signature: 89 50 4E 47
-      if (imageBuffer[0] === 0x89 && imageBuffer[1] === 0x50 && imageBuffer[2] === 0x4E && imageBuffer[3] === 0x47) {
-        mimeType = 'image/png';
-      }
-      // JPEG signature: FF D8 FF
-      else if (imageBuffer[0] === 0xFF && imageBuffer[1] === 0xD8 && imageBuffer[2] === 0xFF) {
-        mimeType = 'image/jpeg';
-      }
-    }
-
-    // Generate content with image
-    console.log(`🤖 [Gemini Vision] Calling ${MODEL_NAME} with image input...`);
-    console.log(`📊 [Gemini Vision] Image size: ${imageBuffer.length} bytes`);
-    console.log(`📊 [Gemini Vision] Prompt length: ${prompt.length} characters`);
-    console.log(`📊 [Gemini Vision] Max output tokens: ${options.maxOutputTokens || 8192}`);
-    
-    const result = await model.generateContent([
-      {
-        inlineData: {
-          data: imageBase64,
-          mimeType: mimeType,
+      // Get model
+      const model = client.getGenerativeModel({
+        model: MODEL_NAME,
+        generationConfig: {
+          maxOutputTokens: options.maxOutputTokens || 8192,
+          temperature: options.temperature !== undefined ? options.temperature : 0,
         },
-      },
-      { text: prompt },
-    ]);
+      });
+
+      // Convert image buffer to base64
+      const imageBase64 = imageBuffer.toString('base64');
+      
+      // Detect MIME type from buffer signature
+      let mimeType = 'image/png'; // Default
+      if (imageBuffer.length >= 4) {
+        // PNG signature: 89 50 4E 47
+        if (imageBuffer[0] === 0x89 && imageBuffer[1] === 0x50 && imageBuffer[2] === 0x4E && imageBuffer[3] === 0x47) {
+          mimeType = 'image/png';
+        }
+        // JPEG signature: FF D8 FF
+        else if (imageBuffer[0] === 0xFF && imageBuffer[1] === 0xD8 && imageBuffer[2] === 0xFF) {
+          mimeType = 'image/jpeg';
+        }
+      }
+
+      // Generate content with image
+      if (attempt > 0) {
+        console.log(`🔄 [Gemini Vision] Retry attempt ${attempt}/${maxRetries}...`);
+      } else {
+        console.log(`🤖 [Gemini Vision] Calling ${MODEL_NAME} with image input...`);
+      }
+      console.log(`📊 [Gemini Vision] Image size: ${imageBuffer.length} bytes`);
+      console.log(`📊 [Gemini Vision] Prompt length: ${prompt.length} characters`);
+      console.log(`📊 [Gemini Vision] Max output tokens: ${options.maxOutputTokens || 8192}`);
+      console.log(`📊 [Gemini Vision] disableRetry: ${options.disableRetry}, maxRetries: ${maxRetries}, attempt: ${attempt}`);
+      
+      const result = await model.generateContent([
+        {
+          inlineData: {
+            data: imageBase64,
+            mimeType: mimeType,
+          },
+        },
+        { text: prompt },
+      ]);
     
     const response = await result.response;
-    const text = response.text();
     
-    if (!text || text.trim().length === 0) {
-      throw new Error("Gemini Vision returned empty response");
+    // Check response candidates and finish reason
+    if (response.candidates && response.candidates.length > 0) {
+      const candidate = response.candidates[0];
+      
+      // Log finish reason for debugging
+      if (candidate.finishReason) {
+        console.log(`📊 [Gemini Vision] Finish reason: ${candidate.finishReason}`);
+      }
+      
+      // Check for safety ratings
+      if (candidate.safetyRatings && candidate.safetyRatings.length > 0) {
+        const blockedRatings = candidate.safetyRatings.filter(r => r.blocked === true);
+        if (blockedRatings.length > 0) {
+          console.warn(`⚠️ [Gemini Vision] Content blocked by safety filter:`, blockedRatings.map(r => r.category).join(', '));
+        }
+      }
+      
+      // If blocked, try to get text anyway (might be partial)
+      if (candidate.finishReason === 'SAFETY' || candidate.finishReason === 'RECITATION') {
+        console.warn(`⚠️ [Gemini Vision] Response blocked by ${candidate.finishReason}, attempting to extract text anyway`);
+      }
     }
     
-    console.log(`✅ [Gemini Vision] Generated ${text.length} characters`);
+    // Try to get text
+    let text;
+    const finishReason = response.candidates?.[0]?.finishReason;
     
-    return text;
-  } catch (error) {
-    console.error(`❌ [Gemini Vision] Error generating vision content:`, error);
-    throw new Error(`Gemini Vision generation failed: ${error.message}`);
+    try {
+      text = response.text();
+    } catch (textError) {
+      // If text() throws, check if there's content in candidates
+      if (response.candidates && response.candidates.length > 0 && response.candidates[0].content) {
+        const content = response.candidates[0].content;
+        if (content.parts && content.parts.length > 0) {
+          text = content.parts.map(part => part.text || '').join('');
+          console.log(`📊 [Gemini Vision] Extracted text from content.parts (${text.length} chars) due to text() error`);
+        }
+      }
+    }
+    
+    // If text is still empty, try to extract from candidates directly (for MAX_TOKENS case)
+    if (!text || text.trim().length === 0) {
+      if (response.candidates && response.candidates.length > 0) {
+        const candidate = response.candidates[0];
+        if (candidate.content && candidate.content.parts) {
+          const partsText = candidate.content.parts
+            .filter(part => part.text)
+            .map(part => part.text)
+            .join('');
+          
+          if (partsText && partsText.trim().length > 0) {
+            text = partsText;
+            console.log(`📊 [Gemini Vision] Extracted text from candidate.content.parts (${text.length} chars) for finishReason: ${finishReason}`);
+          }
+        }
+      }
+    }
+    
+    if (!text || text.trim().length === 0) {
+      // Log detailed error info
+      console.error(`❌ [Gemini Vision] Empty response details:`, {
+        hasResponse: !!response,
+        hasCandidates: !!response.candidates,
+        candidatesCount: response.candidates?.length || 0,
+        finishReason: finishReason,
+        safetyRatings: response.candidates?.[0]?.safetyRatings,
+        hasContent: !!response.candidates?.[0]?.content,
+        hasParts: !!response.candidates?.[0]?.content?.parts,
+        partsCount: response.candidates?.[0]?.content?.parts?.length || 0,
+      });
+      throw new Error(`Gemini Vision returned empty response (finishReason: ${finishReason || 'unknown'})`);
+    }
+    
+      console.log(`✅ [Gemini Vision] Generated ${text.length} characters`);
+      
+      return text;
+    } catch (error) {
+      const isLastAttempt = attempt === maxRetries;
+      const isMaxTokens = error.message.includes('MAX_TOKENS');
+      const isRetryable = (error.message.includes('empty response') && !isMaxTokens) || 
+                         error.message.includes('SAFETY') ||
+                         error.message.includes('RECITATION');
+      
+      // For MAX_TOKENS, always increase maxOutputTokens and retry (even if disableRetry is true)
+      // This is because MAX_TOKENS is a recoverable error that can be fixed by increasing tokens
+      if (isMaxTokens) {
+        const currentMaxTokens = options.maxOutputTokens || 8192;
+        const newMaxTokens = Math.min(32768, currentMaxTokens * 2); // Double, but cap at 32k
+        
+        if (!isLastAttempt) {
+          // Normal retry case
+          console.warn(`⚠️ [Gemini Vision] MAX_TOKENS reached (${currentMaxTokens}), increasing to ${newMaxTokens} on retry (MAX_TOKENS always retries even if disableRetry=true)`);
+          options.maxOutputTokens = newMaxTokens;
+          console.log(`⏳ [Gemini Vision] Waiting ${retryDelay}ms before retry with increased tokens...`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+          continue; // Retry with increased tokens
+        } else if (options.disableRetry && !maxTokensRetryDone) {
+          // Special case: allow one more retry for MAX_TOKENS even if disableRetry is true and on last attempt
+          console.warn(`⚠️ [Gemini Vision] MAX_TOKENS reached on last attempt (${currentMaxTokens}), but allowing one more retry with ${newMaxTokens} tokens (MAX_TOKENS special case)`);
+          options.maxOutputTokens = newMaxTokens;
+          maxTokensRetryDone = true; // Mark that we've done the MAX_TOKENS retry
+          effectiveMaxRetries = attempt + 1; // Increase max retries to allow one more attempt
+          console.log(`⏳ [Gemini Vision] Waiting ${retryDelay}ms before final retry with increased tokens...`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+          continue; // One more retry for MAX_TOKENS
+        }
+      }
+      
+      // For other retryable errors, only retry if disableRetry is false
+      if (isRetryable && !isLastAttempt && !options.disableRetry) {
+        console.warn(`⚠️ [Gemini Vision] Retryable error on attempt ${attempt + 1}/${maxRetries + 1}: ${error.message}`);
+        console.log(`⏳ [Gemini Vision] Waiting ${retryDelay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        continue; // Retry
+      }
+      
+      // Last attempt or non-retryable error
+      console.error(`❌ [Gemini Vision] Error generating vision content (attempt ${attempt + 1}/${maxRetries + 1}):`, error);
+      throw new Error(`Gemini Vision generation failed: ${error.message}`);
+    }
   }
+  
+  // Should never reach here, but just in case
+  throw new Error(`Gemini Vision generation failed after ${maxRetries + 1} attempts`);
 }
 
 /**

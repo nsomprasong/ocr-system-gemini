@@ -74,13 +74,8 @@ export async function createUserProfile(user) {
       // ไม่เป็นไร - จะสร้างใหม่
     }
     
-    // Enable network ก่อน
-    try {
-      await enableNetwork(db)
-      console.log(`✅ Network enabled`)
-    } catch (networkError) {
-      console.warn(`⚠️ Network enable warning:`, networkError.message)
-    }
+    // ไม่ต้องเรียก enableNetwork เพราะ network ควรเปิดอยู่แล้ว
+    // การเรียก enableNetwork ขณะมี listener ทำงานอยู่จะทำให้เกิด internal assertion error
     
     const userData = {
       uid: user.uid,
@@ -220,14 +215,8 @@ export async function deductCreditsFromFirebase(uid, pagesToDeduct) {
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // Enable network ก่อนทุกครั้ง
-      console.log(`🔌 Enabling network (attempt ${attempt})...`)
-      try {
-        await enableNetwork(db)
-        console.log(`✅ Network enabled`)
-      } catch (networkError) {
-        console.warn(`⚠️ Network enable warning:`, networkError.message)
-      }
+      // ไม่ต้องเรียก enableNetwork เพราะ network ควรเปิดอยู่แล้ว
+      // การเรียก enableNetwork ขณะมี listener ทำงานอยู่จะทำให้เกิด internal assertion error
       
       // ดึงเครดิตปัจจุบันจาก Firebase
       console.log(`📥 Fetching current credits from Firebase...`)
@@ -385,6 +374,107 @@ export async function deductCreditsFromFirebase(uid, pagesToDeduct) {
   throw new Error(errorMsg)
 }
 
+// คืนเครดิตเมื่อเกิด error
+export async function refundCreditsToFirebase(uid, pagesToRefund) {
+  const ref = doc(db, "users", uid)
+  const maxRetries = 3
+  let lastError = null
+  
+  console.log(`💰 Starting credit refund: uid=${uid}, pagesToRefund=${pagesToRefund}`)
+  
+  // แปลง pagesToRefund เป็น number
+  const pagesToRefundNum = Number(pagesToRefund)
+  if (isNaN(pagesToRefundNum) || pagesToRefundNum <= 0) {
+    throw new Error(`จำนวนหน้าที่จะคืนไม่ถูกต้อง: ${pagesToRefund}`)
+  }
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // ไม่ต้องเรียก enableNetwork เพราะ network ควรเปิดอยู่แล้ว
+      // การเรียก enableNetwork ขณะมี listener (onSnapshot) ทำงานอยู่จะทำให้เกิด internal assertion error
+      
+      // ดึงเครดิตปัจจุบันจาก Firebase
+      console.log(`📥 Fetching current credits from Firebase...`)
+      const currentSnap = await Promise.race([
+        getDoc(ref),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error("getDoc timeout: เกิน 10 วินาที")), 10000)
+        )
+      ])
+      
+      if (!currentSnap.exists()) {
+        throw new Error("ไม่พบข้อมูลผู้ใช้ใน Firebase")
+      }
+      
+      const currentData = currentSnap.data()
+      
+      // แปลง credits เป็น number
+      let currentCredits = currentData.credits
+      if (currentCredits === null || currentCredits === undefined) {
+        currentCredits = 0
+      } else if (typeof currentCredits === 'string') {
+        currentCredits = parseFloat(currentCredits)
+        if (isNaN(currentCredits)) {
+          currentCredits = 0
+        }
+      } else if (typeof currentCredits !== 'number') {
+        currentCredits = Number(currentCredits)
+        if (isNaN(currentCredits)) {
+          currentCredits = 0
+        }
+      }
+      
+      currentCredits = Number(currentCredits)
+      
+      console.log(`✅ Current credits from Firebase: ${currentCredits}`)
+      console.log(`📊 Pages to refund: ${pagesToRefundNum}`)
+      
+      // คืนเครดิต
+      const newCredits = Number(currentCredits) + Number(pagesToRefundNum)
+      console.log(`💰 Refunding credits: ${currentCredits} + ${pagesToRefundNum} = ${newCredits}`)
+      
+      // บันทึกกลับทันที
+      const updateData = {
+        credits: newCredits,
+        updatedAt: serverTimestamp(),
+      }
+      
+      console.log(`💾 Saving refunded credits to Firebase: ${newCredits}`)
+      
+      await Promise.race([
+        setDoc(ref, updateData, { merge: true }),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error("setDoc timeout: เกิน 20 วินาที")), 20000)
+        )
+      ])
+      
+      console.log(`✅ Credits refunded successfully: ${newCredits} total`)
+      
+      // Return result
+      return {
+        previousCredits: Number(currentCredits),
+        newCredits: Number(newCredits),
+        refunded: Number(pagesToRefundNum)
+      }
+      
+    } catch (error) {
+      console.error(`❌ Error refunding credits (attempt ${attempt}/${maxRetries}):`, error)
+      lastError = error
+      
+      // ถ้าไม่ใช่ attempt สุดท้าย ให้ retry
+      if (attempt < maxRetries) {
+        const waitTime = attempt * 2000
+        console.log(`⏳ Waiting ${waitTime}ms before retry...`)
+        await new Promise(resolve => setTimeout(resolve, waitTime))
+      }
+    }
+  }
+  
+  // ถ้าทุก attempt ล้มเหลว
+  console.error("❌ All attempts failed to refund credits")
+  throw new Error(`ไม่สามารถคืนเครดิตได้: ${lastError?.message || "Unknown error"}`)
+}
+
 // อัปเดตเครดิต
 export async function updateUserCredits(uid, newCredits) {
   const ref = doc(db, "users", uid)
@@ -397,15 +487,8 @@ export async function updateUserCredits(uid, newCredits) {
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // Enable network ก่อนทุกครั้ง
-      console.log(`🔌 Enabling network (attempt ${attempt})...`)
-      try {
-        await enableNetwork(db)
-        console.log(`✅ Network enabled`)
-      } catch (networkError) {
-        console.warn(`⚠️ Network enable warning:`, networkError.message)
-        // ไม่เป็นไร - อาจจะ enable อยู่แล้ว
-      }
+      // ไม่ต้องเรียก enableNetwork เพราะ network ควรเปิดอยู่แล้ว
+      // การเรียก enableNetwork ขณะมี listener ทำงานอยู่จะทำให้เกิด internal assertion error
       
       console.log(`💾 Updating credits in Firestore (attempt ${attempt}/${maxRetries}): ${newCredits}`)
       

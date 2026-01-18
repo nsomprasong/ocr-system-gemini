@@ -36,8 +36,8 @@ import WarningIcon from "@mui/icons-material/Warning"
 import { Slide } from "@mui/material"
 import { getPdfPageCount, isPdfFile } from "../services/pdf.service"
 import { auth, db } from "../firebase"
-import { updateUserCredits, getUserProfile, deductCreditsFromFirebase } from "../services/user.service"
-import { doc, getDoc } from "firebase/firestore"
+import { updateUserCredits, getUserProfile, deductCreditsFromFirebase, refundCreditsToFirebase } from "../services/user.service"
+import { doc, onSnapshot, updateDoc } from "firebase/firestore"
 // Removed: import { ocrFile } from "../services/ocr.service" - not used, using runOCR (v2) instead
 import { extractDataFromText } from "../services/textProcessor.service"
 import {
@@ -46,8 +46,9 @@ import {
   createExcelFile,
   createVisionExcelFile,
 } from "../services/excel.service"
-import { runOCR } from "../utils/runOCR"
-import { smartOcrPdf, smartOcrVisionPdf } from "../services/smartOcr.service"
+// Removed: import { runOCR } from "../utils/runOCR" - not used, using smartOcrVisionPdf directly
+import { smartOcrVisionPdf } from "../services/smartOcr.service"
+import { getDeviceId } from "../utils/deviceId"
 
 // Batch Scan Configuration
 const BATCH_SIZE = 10 // Number of pages per batch
@@ -157,6 +158,9 @@ function calculatePagesToScan(pageRange, startPage, endPage, totalPages) {
  */
 
 export default function Scan({ credits, files, setFiles, onNext, columnConfig, onConsume }) {
+  // Ensure files is always an array
+  const safeFiles = Array.isArray(files) ? files : []
+  
   const [loadingFiles, setLoadingFiles] = useState(new Set())
   const [mode, setMode] = useState("separate")
   const [scanMode, setScanMode] = useState("vision") // OCR or Vision mode: "ocr" | "vision"
@@ -180,14 +184,15 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
   const [showCancelDialog, setShowCancelDialog] = useState(false) // Show cancel confirmation dialog
   const [cancelRequested, setCancelRequested] = useState(false) // Flag to request cancellation after current file (for UI)
   const cancelRequestedRef = useRef(false) // Ref to track cancellation in async functions
+  const [abortController, setAbortController] = useState(null) // State to store AbortController for current scan
   const [showCreditErrorDialog, setShowCreditErrorDialog] = useState(false) // Show credit error dialog
   const [creditErrorInfo, setCreditErrorInfo] = useState(null) // Store credit error info: { fileState, error, queue, currentCredits, onCreditUpdate, fileIndex }
   const creditErrorResolveRef = useRef(null) // Ref to store promise resolve function for credit error dialog
   const scanStartTimeRef = useRef(null) // Start time of scanning (use ref for immediate access)
   const [elapsedTime, setElapsedTime] = useState(0) // Elapsed time in seconds
   const [currentSessionId, setCurrentSessionId] = useState(null) // Current scan session ID
-  const [scanStatus, setScanStatus] = useState(null) // Current scan status from Firestore
-  const statusPollingIntervalRef = useRef(null) // Ref for status polling interval
+  const progressListenerRef = useRef(null) // Ref for Firestore real-time listener unsubscribe function
+  const [previewData, setPreviewData] = useState(null) // Preview data from Firestore: { pageResults: [], totalPages: number, currentFile: string }
 
   const handleSelect = async (fileList) => {
     try {
@@ -237,7 +242,10 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
         })
       )
       
-      setFiles((prev) => [...prev, ...selected])
+      setFiles((prev) => {
+        const prevArray = Array.isArray(prev) ? prev : []
+        return [...prevArray, ...selected]
+      })
       setLoadingFiles(new Set())
       
       // If scanning is in progress, add new files to queue
@@ -262,7 +270,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
   }
 
   const removeFile = (index) => {
-    const fileToRemove = files[index]
+    const fileToRemove = safeFiles[index]
     setFiles((prev) => prev.filter((_, i) => i !== index))
     
     // If scanning is in progress, also remove from queue
@@ -278,7 +286,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
   }
 
 
-  const totalPages = files.reduce((s, f) => s + f.pageCount, 0)
+  const totalPages = safeFiles.reduce((s, f) => s + f.pageCount, 0)
   const creditEnough = credits >= totalPages
 
   // Timer effect - update elapsed time every second when scanning
@@ -321,74 +329,107 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
     return `scan_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`
   }
 
-  // Poll Firestore for scan status
-  const pollScanStatus = async (sessionId) => {
+  // Start real-time progress listener
+  const startProgressListener = (sessionId, deviceId) => {
     if (!sessionId) return
     
+    const user = auth.currentUser;
+    if (!user) {
+      console.warn(`⚠️ [Progress] User not authenticated, cannot start listener`);
+      return;
+    }
+    
+    // Stop existing listener if any
+    stopProgressListener()
+    
     try {
-      const statusRef = doc(db, "scanStatus", sessionId)
-      const statusSnap = await getDoc(statusRef)
+      const progressRef = doc(db, "scanProgress", sessionId)
       
-      if (statusSnap.exists()) {
-        const statusData = statusSnap.data()
-        setScanStatus(statusData)
-        console.log(`📊 [Status] Polled status:`, statusData)
-        
-        // Stop polling if scan is completed or failed
-        if (statusData.status === "completed" || statusData.status === "failed" || statusData.status === "error") {
-          console.log(`✅ [Status] Scan ${statusData.status}, stopping polling...`)
-          stopStatusPolling()
+      // Set up real-time listener
+      const unsubscribe = onSnapshot(
+        progressRef,
+        (snapshot) => {
+          if (snapshot.exists()) {
+            const progressData = snapshot.data()
+            
+            // ตรวจสอบว่า progress document เป็นของ user คนนี้หรือไม่
+            if (progressData.userId && progressData.userId !== user.uid) {
+              console.warn(`⚠️ [Progress] Progress document belongs to different user (${progressData.userId} vs ${user.uid}), ignoring...`);
+              stopProgressListener();
+              return;
+            }
+            
+            // ตรวจสอบว่า progress document เป็นของ device นี้หรือไม่ (ถ้ามี deviceId)
+            if (deviceId && progressData.deviceId && progressData.deviceId !== deviceId) {
+              console.warn(`⚠️ [Progress] Progress document belongs to different device (${progressData.deviceId} vs ${deviceId}), ignoring...`);
+              stopProgressListener();
+              return;
+            }
+            
+            console.log(`📊 [Progress] Real-time update:`, progressData)
+            
+            // Update progress state
+            if (progressData.percentage !== undefined) {
+              setProgress(Math.min(100, progressData.percentage))
+            }
+            if (progressData.message) {
+              setProgressMessage(progressData.message)
+            }
+            
+            // Update preview data if pageResults are available
+            if (progressData.pageResults && Array.isArray(progressData.pageResults)) {
+              // Flatten all records from all pages for preview
+              const allRecords = []
+              progressData.pageResults.forEach(pageResult => {
+                if (pageResult.records && Array.isArray(pageResult.records)) {
+                  allRecords.push(...pageResult.records)
+                }
+              })
+              
+              setPreviewData({
+                pageResults: progressData.pageResults,
+                allRecords: allRecords,
+                totalPages: progressData.totalPages || 0,
+                currentPage: progressData.currentPage || 0,
+                fileName: currentFile || "กำลังประมวลผล...",
+              })
+              
+              console.log(`📋 [Preview] Updated preview: ${allRecords.length} records from ${progressData.pageResults.length} pages`)
+            }
+            
+            // Stop listener if completed or error
+            if (progressData.status === "completed" || progressData.status === "error") {
+              console.log(`✅ [Progress] Scan ${progressData.status}, stopping listener...`)
+              stopProgressListener()
+            }
+          } else {
+            console.log(`📊 [Progress] No progress document found for session: ${sessionId}`)
+          }
+        },
+        (error) => {
+          console.error(`❌ [Progress] Listener error:`, error)
         }
-      } else {
-        console.log(`📊 [Status] No status document found for session: ${sessionId}`)
-        // If status document doesn't exist, stop polling after a few attempts
-        // This will be handled by the timeout mechanism
-      }
+      )
+      
+      // Store unsubscribe function
+      progressListenerRef.current = unsubscribe
     } catch (error) {
-      console.error(`❌ [Status] Failed to poll status:`, error)
+      console.error(`❌ [Progress] Failed to start listener:`, error)
     }
   }
 
-  // Start status polling
-  const startStatusPolling = (sessionId) => {
-    // Clear existing interval if any
-    if (statusPollingIntervalRef.current) {
-      clearInterval(statusPollingIntervalRef.current)
-      statusPollingIntervalRef.current = null
+  // Stop progress listener
+  const stopProgressListener = () => {
+    if (progressListenerRef.current) {
+      progressListenerRef.current()
+      progressListenerRef.current = null
     }
-    
-    // Poll immediately
-    pollScanStatus(sessionId)
-    
-    // Poll every 2 seconds, but stop after max 5 minutes (150 attempts) to prevent infinite polling
-    let pollCount = 0
-    const maxPolls = 150 // 5 minutes max (150 * 2 seconds = 300 seconds)
-    
-    statusPollingIntervalRef.current = setInterval(() => {
-      pollCount++
-      if (pollCount >= maxPolls) {
-        console.log(`⚠️ [Status] Max polling attempts reached (${maxPolls}), stopping...`)
-        stopStatusPolling()
-        return
-      }
-      pollScanStatus(sessionId)
-    }, 2000)
   }
 
-  // Stop status polling
-  const stopStatusPolling = () => {
-    if (statusPollingIntervalRef.current) {
-      clearInterval(statusPollingIntervalRef.current)
-      statusPollingIntervalRef.current = null
-    }
-    setScanStatus(null)
-    setCurrentSessionId(null)
-  }
-
-  // Cleanup polling on unmount
+  // Cleanup listener on unmount
   useEffect(() => {
     return () => {
-      stopStatusPolling()
+      stopProgressListener()
     }
   }, [])
 
@@ -454,178 +495,339 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
     // Use the new credits from Firebase for next file
     const updatedCredits = creditResult.newCredits
     
-    // Process pages in batches (only scan pages in pagesToScan)
-    // Now proceed with scanning after credits are deducted
-    // Note: We continue scanning even if cancel is requested, to finish current file
-    for (let i = 0; i < pagesToScan.length; i += BATCH_SIZE) {
-      const batchPages = pagesToScan.slice(i, i + BATCH_SIZE)
-      const startPage = batchPages[0]
-      const endPage = batchPages[batchPages.length - 1]
+    // Process all pages in one request (backend will process page by page)
+    try {
+      // Determine page range
+      const startPage = pagesToScan[0]
+      const endPage = pagesToScan[pagesToScan.length - 1]
       
       setCurrentBatch({ start: startPage, end: endPage })
       
-      console.log(`📄 [BatchScan] Processing batch: pages ${startPage}-${endPage} (${batchPages.length} pages)`)
+      console.log(`📄 [Scan] Processing all pages: ${startPage}-${endPage} (${pagesToScan.length} pages)`)
       
-      try {
-        // Generate session ID for this batch
-        const batchSessionId = generateSessionId()
-        setCurrentSessionId(batchSessionId)
-        startStatusPolling(batchSessionId)
+      // Generate session ID
+      const sessionId = generateSessionId()
+      setCurrentSessionId(sessionId)
+      
+      // Show initial progress
+      setProgress(0)
+      setProgressMessage(`กำลังเริ่มต้น...`)
+      
+      // Get device ID for device isolation
+      const deviceId = getDeviceId()
+      
+      // Start real-time progress listener
+      startProgressListener(sessionId, deviceId)
+      
+      // Create AbortController for this scan
+      const newAbortController = new AbortController()
+      setAbortController(newAbortController)
+      
+      // Call smartOcrVisionPdf with perPage mode for all pages
+      const visionResult = await smartOcrVisionPdf(fileState.file, {
+        scanMode: "perPage", // Use perPage mode
+        pageRange: pagesToScan, // Send pageRange array (supports ranges like 1,2,5-7)
+        sessionId: sessionId, // Send sessionId to backend
+        userId: user.uid, // Send userId to backend for user isolation
+        deviceId: deviceId, // Send deviceId to backend for device isolation
+        signal: newAbortController.signal, // Pass AbortSignal for cancellation
+      }).finally(() => {
+        // Stop listener when API call completes
+        stopProgressListener()
+        // Clear abortController when done
+        setAbortController(null)
+      })
         
-        // Call OCR API with perPage mode
-        const runOCRResult = await runOCR(fileState.file, {
-          scanMode: "perPage", // Use perPage mode for batch processing
-          startPage: startPage,
-          endPage: endPage,
-          sessionId: batchSessionId, // Send sessionId for status tracking
-        })
-        
-        // Handle perPage response format
-        const ocrResult = runOCRResult.ocrResult
-        
-        // Log raw response for debugging
-        console.log(`🔍 [BatchScan] Raw OCR result for batch ${startPage}-${endPage}:`, {
-          hasOcrResult: !!ocrResult,
-          scanMode: ocrResult?.scanMode,
-          hasPages: !!ocrResult?.pages,
-          pagesCount: ocrResult?.pages?.length,
-          pages: ocrResult?.pages?.map(p => ({ pageNumber: p.pageNumber, hasData: !!p.data, hasError: !!p.error }))
-        })
-        
-        // Check if result is perPage format
-        if (ocrResult && typeof ocrResult === 'object' && 'scanMode' in ocrResult && ocrResult.scanMode === "perPage" && ocrResult.pages) {
-          // Per-page results format
-          const expectedPagesInBatch = batchPages.length
-          console.log(`✅ [BatchScan] Received ${ocrResult.pages.length} pages from batch ${startPage}-${endPage} (expected: ${expectedPagesInBatch})`)
+      // Handle perPage response format from smartOcrVisionPdf
+      if (!visionResult.success) {
+        throw new Error(visionResult.error || "smartOcrVisionPdf failed")
+      }
+      
+      // Display progress from backend (use progressHistory to show actual progress)
+      if (visionResult.meta?.progressHistory && Array.isArray(visionResult.meta.progressHistory) && visionResult.meta.progressHistory.length > 0) {
+        // Use the last progress entry from backend
+        const lastProgress = visionResult.meta.progressHistory[visionResult.meta.progressHistory.length - 1]
+        if (lastProgress) {
+          setProgress(Math.min(95, lastProgress.percentage || 100))
+          setProgressMessage(lastProgress.message || "ประมวลผลเสร็จสิ้น")
           
-          const receivedPageNumbers = []
-          const pagesBeforeBatch = fileState.receivedPages.size
-          const pagesWithErrors = []
-          const pagesWithNoData = []
-          
-          for (const pageResult of ocrResult.pages) {
-            // Only process pages that are in our pagesToScan list
-            if (!pagesToScan.includes(pageResult.pageNumber)) {
-              console.warn(`⚠️ [BatchScan] Skipping page ${pageResult.pageNumber} (not in pagesToScan)`)
-              continue
-            }
-            
-            // Handle error case
-            if (pageResult.error) {
-              console.error(`❌ [BatchScan] Page ${pageResult.pageNumber} error:`, pageResult.error)
-              pagesWithErrors.push({ pageNumber: pageResult.pageNumber, error: pageResult.error })
-              continue
-            }
-            
-            // Handle null or missing data case
-            if (!pageResult.data) {
-              console.warn(`⚠️ [BatchScan] Page ${pageResult.pageNumber} has no data (null or missing)`)
-              pagesWithNoData.push(pageResult.pageNumber)
-              continue
-            }
-            
-            // Valid page result
-            fileState.pageResults[pageResult.pageNumber] = pageResult.data
-            fileState.receivedPages.add(pageResult.pageNumber)
-            receivedPageNumbers.push(pageResult.pageNumber)
-            console.log(`✅ [BatchScan] Page ${pageResult.pageNumber} stored`)
+          // Log progress history for debugging
+          console.log(`📊 [Scan] Progress history from backend:`, {
+            totalEntries: visionResult.meta.progressHistory.length,
+            lastProgress: lastProgress,
+            allPages: visionResult.meta.progressHistory.filter(p => p.page).map(p => `Page ${p.page}: ${p.message}`)
+          })
+        }
+      } else if (visionResult.meta?.progress) {
+        setProgress(Math.min(95, visionResult.meta.progress.percentage || 100))
+        setProgressMessage(visionResult.meta.progress.message || "ประมวลผลเสร็จสิ้น")
+      } else {
+        setProgress(95)
+        setProgressMessage("ประมวลผลเสร็จสิ้น")
+      }
+      
+      if (visionResult.scanMode === "perPage" && visionResult.pages) {
+        // Per-page results format
+        console.log(`✅ [Scan] Received ${visionResult.pages.length} pages (expected: ${pagesToScan.length})`)
+        
+        const receivedPageNumbers = []
+        const pagesWithErrors = []
+        const pagesWithNoData = []
+        
+        for (const pageResult of visionResult.pages) {
+          // Only process pages that are in our pagesToScan list
+          if (!pagesToScan.includes(pageResult.pageNumber)) {
+            console.warn(`⚠️ [Scan] Skipping page ${pageResult.pageNumber} (not in pagesToScan)`)
+            continue
           }
           
-          // Log summary
-          if (pagesWithErrors.length > 0) {
-            console.error(`❌ [BatchScan] Batch ${startPage}-${endPage} has ${pagesWithErrors.length} pages with errors:`, pagesWithErrors.map(p => `${p.pageNumber}(${p.error})`).join(', '))
+          // Handle error case
+          if (pageResult.error) {
+            console.error(`❌ [Scan] Page ${pageResult.pageNumber} error:`, pageResult.error)
+            pagesWithErrors.push({ pageNumber: pageResult.pageNumber, error: pageResult.error })
+            continue
           }
-          if (pagesWithNoData.length > 0) {
-            console.warn(`⚠️ [BatchScan] Batch ${startPage}-${endPage} has ${pagesWithNoData.length} pages with no data:`, pagesWithNoData.join(', '))
+          
+          // Handle null or missing data case
+          if (!pageResult.data) {
+            console.warn(`⚠️ [Scan] Page ${pageResult.pageNumber} has no data (null or missing)`)
+            pagesWithNoData.push(pageResult.pageNumber)
+            continue
           }
           
-          const pagesAfterBatch = fileState.receivedPages.size
-          const newPagesInBatch = pagesAfterBatch - pagesBeforeBatch
+          // Valid page result
+          fileState.pageResults[pageResult.pageNumber] = pageResult.data
+          fileState.receivedPages.add(pageResult.pageNumber)
+          receivedPageNumbers.push(pageResult.pageNumber)
           
-          console.log(`📊 [BatchScan] Batch ${startPage}-${endPage}: Received ${newPagesInBatch} new pages (total: ${pagesAfterBatch}/${actualTotalPages})`)
-          console.log(`📋 [BatchScan] Pages in this batch: ${receivedPageNumbers.sort((a, b) => a - b).join(', ')}`)
-          
-          // Check if all expected pages in this batch were received
-          const missingPages = batchPages.filter(pageNum => !fileState.receivedPages.has(pageNum))
-          
-          if (missingPages.length > 0) {
-            console.error(`❌ [BatchScan] Batch ${startPage}-${endPage} missing pages: ${missingPages.join(', ')}`)
-            console.error(`❌ [BatchScan] Expected ${expectedPagesInBatch} pages, received ${newPagesInBatch} pages, missing ${missingPages.length} pages`)
-            console.error(`❌ [BatchScan] Received page numbers: ${receivedPageNumbers.sort((a, b) => a - b).join(', ') || 'none'}`)
-            
-            // If no pages were received at all (no data entries), check if backend returned any results
-            if (newPagesInBatch === 0) {
-              // Check if backend returned any results (including errors)
-              if (ocrResult.pages && ocrResult.pages.length > 0) {
-                // Backend returned results but all had errors or no data
-                const errorPages = ocrResult.pages.filter(p => p.error).map(p => `${p.pageNumber}(${p.error})`).join(', ')
-                console.error(`❌ [BatchScan] Backend returned ${ocrResult.pages.length} page results but all had errors or no data: ${errorPages}`)
-                throw new Error(`All pages in batch ${startPage}-${endPage} failed: ${errorPages}`)
-              } else {
-                // Backend returned no results at all
-                console.error(`❌ [BatchScan] Backend returned no pages for batch ${startPage}-${endPage}. This might indicate a backend error.`)
-                throw new Error(`Backend returned no pages for batch ${startPage}-${endPage}. Please check backend logs.`)
-              }
+          // Store Vision records if available (for Excel export)
+          if (pageResult.records && Array.isArray(pageResult.records)) {
+            if (!fileState.visionRecords) {
+              fileState.visionRecords = {}
             }
-            
-            throw new Error(`Batch ${startPage}-${endPage} incomplete: missing pages ${missingPages.join(', ')}`)
+            fileState.visionRecords[pageResult.pageNumber] = pageResult.records
+            console.log(`💾 [Scan] Stored ${pageResult.records.length} Vision records for page ${pageResult.pageNumber}`)
           } else {
-            console.log(`✅ [BatchScan] Batch ${startPage}-${endPage} complete: all ${expectedPagesInBatch} pages received`)
+            console.warn(`⚠️ [Scan] Page ${pageResult.pageNumber} has no records (records: ${pageResult.records ? 'exists but not array' : 'missing'})`)
           }
-        } else {
-          // Fallback: treat as single result (for backward compatibility)
-          console.warn(`⚠️ [BatchScan] Received non-perPage result, treating as single page`)
-          if (ocrResult && ocrResult.words) {
-            // For single page, assume it's the first page in pagesToScan
-            const firstPage = pagesToScan[0] || 1
-            fileState.pageResults[firstPage] = ocrResult
-            fileState.receivedPages.add(firstPage)
-          }
+          
+          console.log(`✅ [Scan] Page ${pageResult.pageNumber} stored`)
         }
         
-        // Update batch progress immediately after receiving results
-        const currentReceived = fileState.receivedPages.size
-        console.log(`📊 [BatchScan] Updating progress: ${currentReceived}/${actualTotalPages} pages`)
-        setBatchProgress({ 
-          current: currentReceived, 
-          total: actualTotalPages 
-        })
+        // Log summary
+        if (pagesWithErrors.length > 0) {
+          console.error(`❌ [Scan] Has ${pagesWithErrors.length} pages with errors:`, pagesWithErrors.map(p => `${p.pageNumber}(${p.error})`).join(', '))
+        }
+        if (pagesWithNoData.length > 0) {
+          console.warn(`⚠️ [Scan] Has ${pagesWithNoData.length} pages with no data:`, pagesWithNoData.join(', '))
+        }
         
-        // Update overall progress
-        // Progress range: 10-90% (reserve 10% for credit update, 10% for Excel export)
-        const fileIndex = queue.findIndex(f => f.file === fileState.file)
-        const fileProgressBase = 10 + (fileIndex / queue.length) * 80 // Base progress for this file (10-90%)
-        const fileProgressRange = 80 / queue.length // Progress range allocated for each file
-        const fileProgressWithin = (fileState.receivedPages.size / actualTotalPages) * fileProgressRange // Progress within this file (0-fileProgressRange)
-        const totalProgress = fileProgressBase + fileProgressWithin
+        console.log(`📊 [Scan] Received ${fileState.receivedPages.size}/${actualTotalPages} pages`)
+        console.log(`📋 [Scan] Pages received: ${receivedPageNumbers.sort((a, b) => a - b).join(', ')}`)
         
-        setProgress(Math.min(90, totalProgress)) // Cap at 90% (reserve 10% for Excel export)
+        // Check if all expected pages were received
+        // But if cancelled, don't throw error - just log and continue (will export partial data)
+        const missingPages = pagesToScan.filter(pageNum => !fileState.receivedPages.has(pageNum))
         
-        const progressPercent = (fileState.receivedPages.size / actualTotalPages) * 100
-        console.log(`📊 [BatchScan] Progress: ${fileState.receivedPages.size}/${actualTotalPages} pages (${progressPercent.toFixed(1)}%), total: ${totalProgress.toFixed(1)}%`)
-      } catch (batchError) {
-        console.error(`❌ [BatchScan] Error processing batch ${startPage}-${endPage}:`, batchError)
-        fileState.status = "error"
-        fileState.error = `Batch ${startPage}-${endPage} failed: ${batchError.message}`
-        throw batchError
+        if (missingPages.length > 0) {
+          if (cancelRequestedRef.current) {
+            const receivedCount = fileState.receivedPages.size
+            if (receivedCount > 0) {
+              console.warn(`⚠️ [Scan] Missing pages (cancelled): ${missingPages.join(', ')} - will export partial data (${receivedCount} pages)`)
+            } else {
+              console.warn(`⚠️ [Scan] Missing pages (cancelled): ${missingPages.join(', ')} - no data to export (0 pages received)`)
+            }
+            // Don't throw error when cancelled - allow export of partial data (if any)
+          } else {
+            console.error(`❌ [Scan] Missing pages: ${missingPages.join(', ')}`)
+            throw new Error(`Incomplete: missing pages ${missingPages.join(', ')}`)
+          }
+        } else {
+          console.log(`✅ [Scan] Complete: all ${pagesToScan.length} pages received`)
+        }
+      } else {
+        // Fallback: treat as single result (for backward compatibility)
+        console.warn(`⚠️ [Scan] Received non-perPage result, treating as single page`)
+        if (visionResult.result && visionResult.result.words) {
+          const firstPage = pagesToScan[0] || 1
+          fileState.pageResults[firstPage] = visionResult.result
+          fileState.receivedPages.add(firstPage)
+        }
       }
+      
+      // Update progress
+      setBatchProgress({ 
+        current: fileState.receivedPages.size, 
+        total: actualTotalPages 
+      })
+      
+      // Update overall progress
+      const fileIndex = queue.findIndex(f => f.file === fileState.file)
+      const overallFileProgressBase = 10 + (fileIndex / queue.length) * 80
+      const overallFileProgressRange = 80 / queue.length
+      const overallFileProgressWithin = (fileState.receivedPages.size / actualTotalPages) * overallFileProgressRange
+      const totalProgress = overallFileProgressBase + overallFileProgressWithin
+      
+      setProgress(Math.min(90, totalProgress))
+      
+      const progressPercent = (fileState.receivedPages.size / actualTotalPages) * 100
+      console.log(`📊 [Scan] Progress: ${fileState.receivedPages.size}/${actualTotalPages} pages (${progressPercent.toFixed(1)}%), total: ${totalProgress.toFixed(1)}%`)
+      
+      // Verify all pages were received
+      // But if cancelled, don't throw error - just log and continue (will export partial data)
+      const receivedCount = fileState.receivedPages.size
+      const expectedCount = actualTotalPages
+      
+      // Check if cancelled and refund credits if needed (before checking completeness)
+      if (cancelRequestedRef.current) {
+        console.log(`⚠️ [Scan] User cancelled - calculating and refunding remaining credits for ${fileState.originalName}`)
+        console.log(`📊 [Scan] Cancel refund calculation: pagesToDeduct=${pagesToDeduct}, fileState.visionRecords=`, fileState.visionRecords, `fileState.receivedPages=`, fileState.receivedPages)
+        try {
+          const totalPages = pagesToDeduct
+          let processedPages = 0
+          if (fileState.visionRecords && typeof fileState.visionRecords === 'object') {
+            if (Array.isArray(fileState.visionRecords)) {
+              processedPages = fileState.visionRecords.length
+            } else {
+              processedPages = Object.keys(fileState.visionRecords).length
+            }
+          } else if (fileState.receivedPages) {
+            processedPages = fileState.receivedPages.size
+          }
+          const remainingPages = totalPages - processedPages
+          
+          console.log(`📊 [Scan] Refund calculation: totalPages=${totalPages}, processedPages=${processedPages}, remainingPages=${remainingPages}`)
+          
+          if (remainingPages > 0) {
+            console.log(`💰 [Scan] Refunding remaining credits: ${remainingPages} pages (${processedPages}/${totalPages} processed)`)
+            const refundResult = await refundCreditsToFirebase(user.uid, remainingPages)
+            console.log(`✅ [Scan] Credits refunded: ${refundResult.previousCredits} -> ${refundResult.newCredits} (${refundResult.refunded} pages)`)
+            if (onCreditUpdate) {
+              onCreditUpdate(-refundResult.refunded, refundResult.newCredits)
+            }
+          } else {
+            console.log(`ℹ️ [Scan] No remaining credits to refund (${processedPages}/${totalPages} pages processed)`)
+          }
+        } catch (refundError) {
+          console.error(`❌ [Scan] Failed to refund remaining credits:`, refundError)
+        }
+      }
+      
+      if (receivedCount !== expectedCount) {
+        if (cancelRequestedRef.current) {
+          if (receivedCount > 0) {
+            console.warn(`⚠️ [Scan] File ${fileState.originalName} incomplete (cancelled): ${receivedCount}/${expectedCount} pages - will export partial data`)
+          } else {
+            console.warn(`⚠️ [Scan] File ${fileState.originalName} incomplete (cancelled): ${receivedCount}/${expectedCount} pages - no data to export`)
+          }
+          // Don't throw error when cancelled - allow export of partial data (if any)
+          fileState.status = "done" // Mark as done even if incomplete (due to cancellation)
+        } else {
+          console.error(`❌ [Scan] File ${fileState.originalName} incomplete: ${receivedCount}/${expectedCount} pages`)
+          throw new Error(`File incomplete: ${receivedCount}/${expectedCount} pages received`)
+        }
+      } else {
+        fileState.status = "done"
+        console.log(`✅ [Scan] Completed: ${fileState.originalName} (${receivedCount}/${expectedCount} pages)`)
+      }
+      
+    } catch (scanError) {
+      console.error(`❌ [Scan] Error processing file:`, scanError)
+      fileState.status = "error"
+      fileState.error = `Scan failed: ${scanError.message}`
+      
+      // Check if error is due to cancellation
+      const isCancelled = cancelRequestedRef.current || scanError.message?.includes('cancelled') || scanError.message?.includes('ยกเลิก')
+      
+      // Refund credits if error occurred after deduction (but not if user cancelled or credit deduction failed)
+      const isCreditError = scanError.isCreditError || scanError.name === 'CreditDeductionError' || scanError.message?.includes('หักเครดิต')
+      
+      if (creditResult && !isCancelled && !isCreditError) {
+        try {
+          console.log(`💰 [Scan] Refunding credits for ${fileState.originalName}: ${pagesToDeduct} pages`)
+          const refundResult = await refundCreditsToFirebase(user.uid, pagesToDeduct)
+          console.log(`✅ [Scan] Credits refunded successfully: ${refundResult.previousCredits} -> ${refundResult.newCredits} (${refundResult.refunded} pages)`)
+          
+          // Update credits in parent component
+          if (onCreditUpdate) {
+            onCreditUpdate(-refundResult.refunded, refundResult.newCredits) // Negative to indicate refund
+          }
+        } catch (refundError) {
+          console.error(`❌ [Scan] Failed to refund credits:`, refundError)
+          // Don't throw - we've already logged the error
+        }
+      } else if (isCancelled) {
+        // When cancelled, refund remaining credits (pages that were not processed)
+        console.log(`⚠️ [Scan] User cancelled - calculating and refunding remaining credits for ${fileState.originalName}`)
+        console.log(`📊 [Scan] Cancel refund calculation: pagesToDeduct=${pagesToDeduct}, fileState.visionRecords=`, fileState.visionRecords, `fileState.receivedPages=`, fileState.receivedPages)
+        try {
+          // Calculate remaining pages (pages that were deducted but not processed)
+          // Use pagesToDeduct (which was deducted) as totalPages
+          const totalPages = pagesToDeduct
+          let processedPages = 0
+          if (fileState.visionRecords && typeof fileState.visionRecords === 'object') {
+            if (Array.isArray(fileState.visionRecords)) {
+              processedPages = fileState.visionRecords.length
+            } else {
+              processedPages = Object.keys(fileState.visionRecords).length
+            }
+          } else if (fileState.receivedPages) {
+            processedPages = fileState.receivedPages.size
+          }
+          const remainingPages = totalPages - processedPages
+          
+          console.log(`📊 [Scan] Refund calculation: totalPages=${totalPages}, processedPages=${processedPages}, remainingPages=${remainingPages}`)
+          
+          if (remainingPages > 0) {
+            console.log(`💰 [Scan] Refunding remaining credits: ${remainingPages} pages (${processedPages}/${totalPages} processed)`)
+            const refundResult = await refundCreditsToFirebase(user.uid, remainingPages)
+            console.log(`✅ [Scan] Credits refunded: ${refundResult.previousCredits} -> ${refundResult.newCredits} (${refundResult.refunded} pages)`)
+            if (onCreditUpdate) {
+              onCreditUpdate(-refundResult.refunded, refundResult.newCredits)
+            }
+          } else {
+            console.log(`ℹ️ [Scan] No remaining credits to refund (${processedPages}/${totalPages} pages processed)`)
+          }
+        } catch (refundError) {
+          console.error(`❌ [Scan] Failed to refund remaining credits:`, refundError)
+        }
+      } else if (isCreditError) {
+        console.log(`⚠️ [Scan] Credit deduction failed - not refunding (credits were not deducted)`)
+      }
+      
+      // Try to export existing data if available
+      if (fileState.visionRecords && Object.keys(fileState.visionRecords).length > 0) {
+        console.log(`⚠️ [Scan] Error occurred but found existing data, attempting to export...`)
+        try {
+          // Convert visionRecords object to flat array
+          let allVisionRecords = []
+          if (typeof fileState.visionRecords === 'object' && !Array.isArray(fileState.visionRecords)) {
+            const sortedPageNumbers = Object.keys(fileState.visionRecords)
+              .map(Number)
+              .sort((a, b) => a - b)
+            for (const pageNum of sortedPageNumbers) {
+              const pageRecords = fileState.visionRecords[pageNum]
+              if (Array.isArray(pageRecords)) {
+                allVisionRecords.push(...pageRecords)
+              }
+            }
+          } else if (Array.isArray(fileState.visionRecords)) {
+            allVisionRecords = fileState.visionRecords
+          }
+          
+          if (allVisionRecords.length > 0) {
+            console.log(`✅ [Scan] Exporting ${allVisionRecords.length} records despite error`)
+            await exportSingleFile(fileState.originalName, allVisionRecords, "vision")
+            setPreviewData(null)
+            console.log(`✅ [Scan] Exported partial data successfully`)
+          }
+        } catch (exportError) {
+          console.error(`❌ [Scan] Failed to export partial data:`, exportError)
+        }
+      }
+      
+      throw scanError
     }
-    
-    // All batches completed - verify all pages were received
-    const receivedCount = fileState.receivedPages.size
-    const expectedCount = actualTotalPages
-    
-    if (receivedCount !== expectedCount) {
-      console.error(`❌ [BatchScan] File ${fileState.originalName} incomplete after all batches: ${receivedCount}/${expectedCount} pages`)
-      console.error(`📋 [BatchScan] Expected pages: [${pagesToScan.join(', ')}]`)
-      console.error(`📋 [BatchScan] Received pages: [${Array.from(fileState.receivedPages).sort((a, b) => a - b).join(', ')}]`)
-      const missingPages = pagesToScan.filter(p => !fileState.receivedPages.has(p))
-      console.error(`📋 [BatchScan] Missing pages: ${missingPages.join(', ')}`)
-      throw new Error(`File incomplete: ${receivedCount}/${expectedCount} pages received`)
-    }
-    
-    fileState.status = "done"
-    console.log(`✅ [BatchScan] Completed: ${fileState.originalName} (${receivedCount}/${expectedCount} pages)`)
   }
 
   /**
@@ -634,7 +836,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
    * @param {Array} data - Extracted data rows
    * @returns {Promise<void>} Promise that resolves when download is complete
    */
-  const exportSingleFile = async (filename, data, currentScanMode = "ocr") => {
+  const exportSingleFile = async (filename, data, currentScanMode = "vision") => {
     const configToUse = columnConfig || []
     
     if (fileType === "xlsx") {
@@ -681,13 +883,32 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
   }
 
   /**
-   * Confirm cancel - finish current file then stop
+   * Confirm cancel - send cancel request to backend, wait for current page to finish, then export data and refund credits
    */
-  const handleConfirmCancel = () => {
+  const handleConfirmCancel = async () => {
     setShowCancelDialog(false)
     setCancelRequested(true)
     cancelRequestedRef.current = true // Set ref immediately for async functions
-    console.log(`⚠️ [BatchScan] Cancel requested - will finish current file then stop`)
+    console.log(`⚠️ [BatchScan] Cancel requested - will finish current page then stop`)
+    
+    // Send cancel request to backend via Firestore (backend will stop after current page)
+    if (currentSessionId) {
+      try {
+        const progressRef = doc(db, "scanProgress", currentSessionId)
+        await updateDoc(progressRef, {
+          cancelled: true,
+          cancelRequestedAt: new Date().toISOString(),
+        })
+        console.log(`✅ [BatchScan] Cancel request sent to backend for session: ${currentSessionId}`)
+        console.log(`⏳ [BatchScan] Waiting for current page to finish...`)
+      } catch (error) {
+        console.error(`❌ [BatchScan] Failed to send cancel request to backend:`, error)
+      }
+    }
+    
+    // Don't abort API call - let it finish current page
+    // Don't stop progress listener - let it continue to receive updates
+    // Export and refund will be handled in runScanQueue after current file finishes
   }
 
   /**
@@ -755,9 +976,9 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
       // Process each file (use queue parameter, not scanQueue state)
       let processedCount = 0
       for (let i = 0; i < queue.length; i++) {
-        // Check if cancel was requested - if so, finish current file then stop
+        // Check if cancel was requested - if so, stop immediately
         if (cancelRequestedRef.current) {
-          console.log(`⚠️ [BatchScan] Cancel requested - stopping after current file`)
+          console.log(`⚠️ [BatchScan] Cancel requested - stopping immediately`)
           // Don't process remaining files
           break
         }
@@ -765,7 +986,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
         const fileState = queue[i]
         
         // Skip if file was removed from files list
-        const fileStillExists = files.some(f => f.file === fileState.file)
+        const fileStillExists = safeFiles.some(f => f.file === fileState.file)
         if (!fileStillExists) {
           console.log(`⏭️ [BatchScan] Skipping removed file: ${fileState.originalName}`)
           continue
@@ -775,6 +996,9 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
         processedCount++
         
         console.log(`📄 [BatchScan] Processing file ${processedCount}/${queue.length}: ${fileState.originalName}`)
+        
+        // Clear preview for new file
+        setPreviewData(null)
         
         try {
           // Calculate pages to scan for this file
@@ -808,7 +1032,45 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
           // Verify that all pages have been processed
           const expectedPages = fileState.pagesToScan ? fileState.pagesToScan.length : fileState.totalPages
           if (fileState.receivedPages.size !== expectedPages) {
-            console.warn(`⚠️ [BatchScan] File ${fileState.originalName} incomplete: ${fileState.receivedPages.size}/${expectedPages} pages`)
+            if (cancelRequestedRef.current) {
+              if (fileState.receivedPages.size > 0) {
+                console.warn(`⚠️ [BatchScan] File ${fileState.originalName} incomplete (cancelled): ${fileState.receivedPages.size}/${expectedPages} pages - will export partial data`)
+                
+                // Export partial data immediately when cancelled
+                try {
+                  let dataToExport = null
+                  if (fileState.visionRecords) {
+                    if (Array.isArray(fileState.visionRecords)) {
+                      dataToExport = fileState.visionRecords
+                    } else if (typeof fileState.visionRecords === 'object') {
+                      const sortedPageNumbers = Object.keys(fileState.visionRecords).map(Number).sort((a, b) => a - b)
+                      dataToExport = []
+                      for (const pageNum of sortedPageNumbers) {
+                        const pageRecords = fileState.visionRecords[pageNum]
+                        if (Array.isArray(pageRecords)) {
+                          dataToExport.push(...pageRecords)
+                        }
+                      }
+                    }
+                  }
+                  
+                  if (dataToExport && dataToExport.length > 0) {
+                    console.log(`💾 [BatchScan] Exporting partial data on cancel: ${dataToExport.length} records`)
+                    setCurrentFile(`กำลังดาวน์โหลดไฟล์ (ข้อมูลบางส่วน): ${fileState.originalName}...`)
+                    setProgress(95)
+                    setProgressMessage("กำลังดาวน์โหลดไฟล์...")
+                    await exportSingleFile(fileState.originalName, dataToExport, "vision")
+                    console.log(`✅ [BatchScan] Partial data exported successfully`)
+                  }
+                } catch (exportError) {
+                  console.error(`❌ [BatchScan] Failed to export partial data on cancel:`, exportError)
+                }
+              } else {
+                console.warn(`⚠️ [BatchScan] File ${fileState.originalName} incomplete (cancelled): ${fileState.receivedPages.size}/${expectedPages} pages - no data to export`)
+              }
+            } else {
+              console.warn(`⚠️ [BatchScan] File ${fileState.originalName} incomplete: ${fileState.receivedPages.size}/${expectedPages} pages`)
+            }
             // Don't process incomplete files
             continue
           }
@@ -879,110 +1141,129 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 }))
                 console.log(`📋 [BatchScan] ColumnDefinitions:`, columnDefinitions.length, "columns", columnDefinitions.map(c => `${c.columnKey}(${c.label})`).join(", "))
                 
-                // Call Smart OCR or Vision API based on scanMode
-                const apiName = scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"
-                console.log(`⏱️ [BatchScan] Starting ${apiName} with 12-minute timeout...`)
-                setCurrentFile(`กำลังประมวลผล ${apiName}: ${fileState.originalName}...`)
-                
-                // Reset progress for new file (100% = 1 file)
-                setProgress(0)
-                setProgressMessage("กำลังเริ่มต้น...")
-                
-                // Progress tracking for Vision mode
-                let progressInterval = null
-                if (scanMode === "vision") {
-                  // Simulate progress updates while waiting for response
-                  let progressStep = 10 // Start from 10%
-                  let progressStage = 0 // 0: converting, 1: classifying, 2: extracting
-                  
-                  progressInterval = setInterval(() => {
-                    progressStep += 2
-                    if (progressStep <= 30) {
-                      // Stage 0: Converting PDF to images
-                      progressStage = 0
-                      setProgress(Math.min(30, progressStep))
-                      setProgressMessage("กำลังแปลง PDF เป็นภาพ...")
-                    } else if (progressStep <= 60) {
-                      // Stage 1: Classifying pages
-                      progressStage = 1
-                      setProgress(Math.min(60, progressStep))
-                      setProgressMessage("กำลังวิเคราะห์ประเภทหน้าเอกสาร...")
-                    } else if (progressStep <= 90) {
-                      // Stage 2: Extracting data
-                      progressStage = 2
-                      const estimatedPage = Math.floor((progressStep - 60) / 30 * (fileState.pageCount || 1))
-                      setProgress(Math.min(90, progressStep))
-                      setProgressMessage(`กำลังส่งภาพเข้า Gemini หน้าที่ ${Math.max(1, estimatedPage)}...`)
-                    }
-                  }, 2000) // Update every 2 seconds
-                } else {
-                  setProgress(85)
-                  setProgressMessage("กำลังประมวลผล OCR...")
+            // Use Vision records from scanSingleFile if available (avoid duplicate API call)
+            let smartOcrResult = null
+            
+            // Convert visionRecords object to flat array if it exists
+            let allVisionRecords = []
+            if (fileState.visionRecords) {
+              if (Array.isArray(fileState.visionRecords)) {
+                // Already an array
+                allVisionRecords = fileState.visionRecords
+              } else if (typeof fileState.visionRecords === 'object') {
+                // Convert object to array (visionRecords[pageNumber] = records[])
+                const sortedPageNumbers = Object.keys(fileState.visionRecords)
+                  .map(Number)
+                  .sort((a, b) => a - b)
+                for (const pageNum of sortedPageNumbers) {
+                  const pageRecords = fileState.visionRecords[pageNum]
+                  if (Array.isArray(pageRecords)) {
+                    allVisionRecords.push(...pageRecords)
+                  }
                 }
-                
-                let smartOcrResult
-                if (scanMode === "vision") {
-                  // Vision mode: call smartOcrVisionPdf (no columnDefinitions needed)
-                  smartOcrResult = await Promise.race([
-                    smartOcrVisionPdf(fileState.file).then((result) => {
-                      // Clear interval when response is received
-                      if (progressInterval) {
-                        clearInterval(progressInterval)
-                        progressInterval = null
-                      }
-                      // Update progress message from response if available
-                      if (result.metadata?.progress) {
-                        setProgressMessage(result.metadata.progress.message || "ประมวลผลเสร็จสิ้น")
-                      }
-                      return result
-                    }),
-                    new Promise((_, reject) =>
-                      setTimeout(
-                        () => {
-                          if (progressInterval) {
-                            clearInterval(progressInterval)
-                            progressInterval = null
-                          }
-                          reject(new Error(`${apiName} timeout: เกิน 12 นาที`))
-                        },
-                        12 * 60 * 1000 // 12 minutes (720 seconds) to match backend timeout
-                      )
-                    ),
-                  ])
+              }
+            }
+            
+            if (allVisionRecords.length > 0) {
+              console.log(`✅ [BatchScan] Using Vision records from scanSingleFile: ${allVisionRecords.length} records`)
+              console.log(`📊 [BatchScan] visionRecords structure:`, {
+                isObject: typeof fileState.visionRecords === 'object' && !Array.isArray(fileState.visionRecords),
+                isArray: Array.isArray(fileState.visionRecords),
+                keys: fileState.visionRecords ? Object.keys(fileState.visionRecords) : [],
+                totalRecords: allVisionRecords.length,
+              })
+              smartOcrResult = {
+                records: allVisionRecords,
+                metadata: {
+                  source: "smart-ocr-vision",
+                  mode: "vision",
+                  pages: fileState.totalPages || 0,
+                  totalRecords: allVisionRecords.length,
+                },
+              }
+              setProgress(90)
+              setProgressMessage("กำลังเตรียมข้อมูลสำหรับส่งออก...")
+            } else {
+              // Fallback: call smartOcrVisionPdf if Vision records not available
+              console.warn(`⚠️ [BatchScan] No Vision records found in fileState.visionRecords, calling API again...`)
+              console.log(`📊 [BatchScan] visionRecords state:`, {
+                exists: !!fileState.visionRecords,
+                type: typeof fileState.visionRecords,
+                isArray: Array.isArray(fileState.visionRecords),
+                isObject: typeof fileState.visionRecords === 'object' && fileState.visionRecords !== null,
+                keys: fileState.visionRecords ? Object.keys(fileState.visionRecords) : [],
+              })
+              const apiName = "Smart OCR Vision"
+              console.log(`⏱️ [BatchScan] Starting ${apiName} with 15-minute timeout...`)
+              setCurrentFile(`กำลังประมวลผล ${apiName}: ${fileState.originalName}...`)
+              
+              // Reset progress for new file (100% = 1 file)
+              setProgress(0)
+              setProgressMessage("กำลังเริ่มต้น...")
+              
+              // Progress tracking for Vision mode
+              let progressInterval = null
+              const totalPages = fileState.pageCount || 1
+              let progressStep = 0
+              
+              progressInterval = setInterval(() => {
+                progressStep += 1.2
+                if (progressStep <= 20) {
+                  setProgress(Math.min(20, progressStep))
+                  setProgressMessage(`กำลังแปลง PDF เป็นภาพ หน้าที่ 1/${totalPages}...`)
+                } else if (progressStep <= 95) {
+                  const extractionProgress = progressStep - 20
+                  const extractionRange = 95 - 20
+                  const pageProgress = (extractionProgress / extractionRange) * totalPages
+                  const currentPage = Math.min(totalPages, Math.max(1, Math.ceil(pageProgress)))
+                  setProgress(Math.min(95, progressStep))
+                  setProgressMessage(`กำลังส่งภาพเข้า Gemini หน้าที่ ${currentPage}/${totalPages}...`)
                 } else {
-                  // OCR mode: call smartOcrPdf (with columnDefinitions)
-                  smartOcrResult = await Promise.race([
-                    smartOcrPdf(fileState.file, columnDefinitions),
-                    new Promise((_, reject) =>
-                      setTimeout(
-                        () => reject(new Error(`${apiName} timeout: เกิน 12 นาที`)),
-                        12 * 60 * 1000 // 12 minutes (720 seconds) to match backend timeout
-                      )
-                    ),
-                  ])
+                  setProgress(Math.min(100, progressStep))
+                  setProgressMessage("กำลังประมวลผลข้อมูล...")
                 }
-                
-                // Clear interval if still running
+              }, 1500)
+              
+              smartOcrResult = await smartOcrVisionPdf(fileState.file).then((result) => {
                 if (progressInterval) {
                   clearInterval(progressInterval)
                   progressInterval = null
                 }
-                
-                console.log(`✅ [BatchScan] Smart OCR API call completed`)
-                setProgress(90) // Update progress after Smart OCR completes
-                setProgressMessage("กำลังเตรียมข้อมูลสำหรับส่งออก...")
-                
-                console.log(`📊 [BatchScan] Smart OCR result:`, {
-                  hasRecords: !!(smartOcrResult?.records),
-                  recordsCount: smartOcrResult?.records?.length || 0,
-                  confidence: smartOcrResult?.metadata?.confidence,
-                  source: smartOcrResult?.metadata?.source,
-                  hasErrors: !!(smartOcrResult?.metadata?.validationErrors),
-                  errorMessage: smartOcrResult?.metadata?.errorMessage,
-                })
-                
-                if (smartOcrResult && smartOcrResult.records && smartOcrResult.records.length > 0) {
-                  console.log(`✅ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} completed: ${smartOcrResult.records.length} records`)
+                if (result.metadata?.progressHistory && Array.isArray(result.metadata.progressHistory)) {
+                  const lastProgress = result.metadata.progressHistory[result.metadata.progressHistory.length - 1]
+                  if (lastProgress) {
+                    setProgress(lastProgress.percentage || 100)
+                    setProgressMessage(lastProgress.message || "ประมวลผลเสร็จสิ้น")
+                  }
+                } else if (result.metadata?.progress) {
+                  setProgress(result.metadata.progress.percentage || 100)
+                  setProgressMessage(result.metadata.progress.message || "ประมวลผลเสร็จสิ้น")
+                } else {
+                  setProgress(100)
+                  setProgressMessage("ประมวลผลเสร็จสิ้น")
+                }
+                return result
+              })
+              
+              if (progressInterval) {
+                clearInterval(progressInterval)
+                progressInterval = null
+              }
+              
+              console.log(`✅ [BatchScan] Smart OCR API call completed`)
+              setProgress(90)
+              setProgressMessage("กำลังเตรียมข้อมูลสำหรับส่งออก...")
+            }
+            
+            console.log(`📊 [BatchScan] Smart OCR result:`, {
+              hasRecords: !!(smartOcrResult?.records),
+              recordsCount: smartOcrResult?.records?.length || 0,
+              confidence: smartOcrResult?.metadata?.confidence,
+              source: smartOcrResult?.metadata?.source,
+            })
+            
+            if (smartOcrResult && smartOcrResult.records && smartOcrResult.records.length > 0) {
+                  console.log(`✅ [BatchScan] Smart OCR Vision completed: ${smartOcrResult.records.length} records`)
                   
                   // Send raw records to Excel export (will be mapped to Excel format in excel.service.js)
                   // 1 record = 1 row in Excel
@@ -995,10 +1276,13 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                     
                     // Export single file immediately and wait for download to complete
                     // Pass raw records, not mapped rows
-                    // Use Vision Excel export if scanMode is "vision"
+                    // Use Vision Excel export (Vision mode only)
                     setProgress(95)
                     setProgressMessage("กำลังดาวน์โหลดไฟล์...")
-                    await exportSingleFile(fileState.originalName, smartOcrResult.records, scanMode)
+                    await exportSingleFile(fileState.originalName, smartOcrResult.records, "vision")
+                    
+                    // Clear preview after export
+                    setPreviewData(null)
                     
                     console.log(`✅ [BatchScan] File exported and download completed: ${fileState.originalName}`)
                     setProgress(100)
@@ -1019,23 +1303,23 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                   // Safety guard: Check if response.success === false
                   if (smartOcrResult && smartOcrResult.success === false) {
                     const errorMsg = smartOcrResult.error || "Unknown error"
-                    console.error(`❌ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} failed for: ${fileState.originalName}`)
+                    console.error(`❌ [BatchScan] Smart OCR Vision failed for: ${fileState.originalName}`)
                     console.error(`❌ [BatchScan] Error:`, errorMsg)
-                    setError(`${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
+                    setError(`Smart OCR Vision ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
                   } else if (!smartOcrResult || !smartOcrResult.records || smartOcrResult.records.length === 0) {
                     // Safety guard: Check if records.length === 0
                     const errorMsg = smartOcrResult?.metadata?.errorMessage || "ไม่พบข้อมูล"
-                    console.error(`❌ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} returned no records for: ${fileState.originalName}`)
+                    console.error(`❌ [BatchScan] Smart OCR Vision returned no records for: ${fileState.originalName}`)
                     console.error(`❌ [BatchScan] Error message:`, errorMsg)
-                    setError(`${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} ไม่พบข้อมูลสำหรับ ${fileState.originalName}. ${errorMsg}`)
+                    setError(`Smart OCR Vision ไม่พบข้อมูลสำหรับ ${fileState.originalName}. ${errorMsg}`)
                   } else {
                     const errorMsg = smartOcrResult?.metadata?.errorMessage || "Unknown error"
                     const validationErrors = smartOcrResult?.metadata?.validationErrors || []
-                    console.error(`❌ [BatchScan] ${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} returned no records for: ${fileState.originalName}`)
+                    console.error(`❌ [BatchScan] Smart OCR Vision returned no records for: ${fileState.originalName}`)
                     console.error(`❌ [BatchScan] Error message:`, errorMsg)
                     console.error(`❌ [BatchScan] Validation errors:`, validationErrors)
                     console.error(`❌ [BatchScan] Full result:`, smartOcrResult)
-                    setError(`${scanMode === "vision" ? "Smart OCR Vision" : "Smart OCR"} ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
+                    setError(`Smart OCR Vision ไม่สามารถแยกข้อมูลได้สำหรับ ${fileState.originalName}. ${errorMsg}`)
                   }
                 }
               } catch (smartOcrError) {
@@ -1046,12 +1330,90 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                   name: smartOcrError.name,
                 })
                 
-                // Update UI to show error but continue
-                setError(`Smart OCR failed for ${fileState.originalName}: ${smartOcrError.message}`)
-                setProgress(95) // Update progress even on error
-                setCurrentFile(`เกิดข้อผิดพลาด: ${fileState.originalName}`)
+                // Try to export existing data if available
+                let hasExported = false
+                if (previewData && previewData.allRecords && previewData.allRecords.length > 0) {
+                  console.log(`⚠️ [BatchScan] Error occurred but found preview data, attempting to export...`)
+                  try {
+                    if (mode === "separate") {
+                      console.log(`💾 [BatchScan] Exporting partial data: ${previewData.allRecords.length} records`)
+                      setCurrentFile(`กำลังดาวน์โหลดไฟล์ (ข้อมูลบางส่วน): ${fileState.originalName}...`)
+                      setProgress(95)
+                      setProgressMessage("กำลังดาวน์โหลดไฟล์...")
+                      await exportSingleFile(fileState.originalName, previewData.allRecords, "vision")
+                      setPreviewData(null)
+                      hasExported = true
+                      console.log(`✅ [BatchScan] Exported partial data successfully`)
+                    } else {
+                      // For combine mode, add to combined data
+                      fileData.push({
+                        filename: fileState.originalName,
+                        data: previewData.allRecords,
+                      })
+                      combinedData.push(...previewData.allRecords)
+                      hasExported = true
+                      console.log(`✅ [BatchScan] Added partial data to combined export`)
+                    }
+                  } catch (exportError) {
+                    console.error(`❌ [BatchScan] Failed to export partial data:`, exportError)
+                  }
+                } else if (fileState.visionRecords && Object.keys(fileState.visionRecords).length > 0) {
+                  console.log(`⚠️ [BatchScan] Error occurred but found visionRecords, attempting to export...`)
+                  try {
+                    // Convert visionRecords object to flat array
+                    let allVisionRecords = []
+                    if (typeof fileState.visionRecords === 'object' && !Array.isArray(fileState.visionRecords)) {
+                      const sortedPageNumbers = Object.keys(fileState.visionRecords)
+                        .map(Number)
+                        .sort((a, b) => a - b)
+                      for (const pageNum of sortedPageNumbers) {
+                        const pageRecords = fileState.visionRecords[pageNum]
+                        if (Array.isArray(pageRecords)) {
+                          allVisionRecords.push(...pageRecords)
+                        }
+                      }
+                    } else if (Array.isArray(fileState.visionRecords)) {
+                      allVisionRecords = fileState.visionRecords
+                    }
+                    
+                    if (allVisionRecords.length > 0) {
+                      if (mode === "separate") {
+                        console.log(`💾 [BatchScan] Exporting partial data: ${allVisionRecords.length} records`)
+                        setCurrentFile(`กำลังดาวน์โหลดไฟล์ (ข้อมูลบางส่วน): ${fileState.originalName}...`)
+                        setProgress(95)
+                        setProgressMessage("กำลังดาวน์โหลดไฟล์...")
+                        await exportSingleFile(fileState.originalName, allVisionRecords, "vision")
+                        setPreviewData(null)
+                        hasExported = true
+                        console.log(`✅ [BatchScan] Exported partial data successfully`)
+                      } else {
+                        // For combine mode, add to combined data
+                        fileData.push({
+                          filename: fileState.originalName,
+                          data: allVisionRecords,
+                        })
+                        combinedData.push(...allVisionRecords)
+                        hasExported = true
+                        console.log(`✅ [BatchScan] Added partial data to combined export`)
+                      }
+                    }
+                  } catch (exportError) {
+                    console.error(`❌ [BatchScan] Failed to export partial data:`, exportError)
+                  }
+                }
                 
-                // Continue without export - don't block the scan process
+                // Update UI to show error
+                if (hasExported) {
+                  setError(`Smart OCR failed for ${fileState.originalName} แต่ได้ export ข้อมูลบางส่วนแล้ว: ${smartOcrError.message}`)
+                  setProgress(100)
+                  setProgressMessage("export ข้อมูลบางส่วนเสร็จสิ้น")
+                } else {
+                  setError(`Smart OCR failed for ${fileState.originalName}: ${smartOcrError.message}`)
+                  setProgress(95)
+                  setCurrentFile(`เกิดข้อผิดพลาด: ${fileState.originalName}`)
+                }
+                
+                // Continue without blocking the scan process
                 console.log(`⚠️ [BatchScan] Continuing scan process despite Smart OCR error`)
               }
             }
@@ -1120,24 +1482,203 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
             }
           }
           
-          // Remove completed file from files list (always remove completed files)
-          setFiles((prev) => prev.filter((fileItem) => fileItem.file !== fileState.file))
-          console.log(`✅ [BatchScan] Removed completed file from list: ${fileState.originalName}`)
-          
           // Check if cancel was requested after finishing current file
-          // If cancelled, stop scanning but keep remaining files (not scanned yet) in the list
+          // If cancelled, export existing data, refund remaining credits, and stop
+          // IMPORTANT: Check BEFORE removing file from list, so we can export data from fileState
           if (cancelRequestedRef.current) {
-            console.log(`⚠️ [BatchScan] Cancel requested - current file finished, stopping scan`)
-            console.log(`📋 [BatchScan] Completed file removed, remaining files kept in list`)
+            console.log(`⚠️ [BatchScan] Cancel requested - checking for data to export and refunding credits`)
+            
+            // Export existing data if available (from current fileState first, then previewData)
+            let hasExported = false
+            let dataToExport = null
+            
+            // First, try to get data from current fileState (just completed)
+            if (fileState.visionRecords) {
+              if (Array.isArray(fileState.visionRecords)) {
+                dataToExport = fileState.visionRecords
+                console.log(`📊 [BatchScan] Found data in current fileState.visionRecords (array): ${dataToExport.length} records`)
+              } else if (typeof fileState.visionRecords === 'object') {
+                // Convert object to array
+                const sortedPageNumbers = Object.keys(fileState.visionRecords).map(Number).sort((a, b) => a - b)
+                dataToExport = []
+                for (const pageNum of sortedPageNumbers) {
+                  const pageRecords = fileState.visionRecords[pageNum]
+                  if (Array.isArray(pageRecords)) {
+                    dataToExport.push(...pageRecords)
+                  }
+                }
+                console.log(`📊 [BatchScan] Found data in current fileState.visionRecords (object): ${dataToExport.length} records from ${sortedPageNumbers.length} pages`)
+              }
+            } else if (fileState.pageResults && Object.keys(fileState.pageResults).length > 0) {
+              // Fallback: try to get data from pageResults
+              console.log(`📊 [BatchScan] Found data in fileState.pageResults: ${Object.keys(fileState.pageResults).length} pages`)
+              // Convert pageResults to records format (if needed)
+              // This depends on your data structure
+            }
+            
+            // If no data from current fileState, try previewData
+            if ((!dataToExport || dataToExport.length === 0) && previewData && previewData.allRecords && previewData.allRecords.length > 0) {
+              dataToExport = previewData.allRecords
+              console.log(`📊 [BatchScan] Found data in previewData: ${dataToExport.length} records`)
+            }
+            
+            // Only export if we have data
+            if (dataToExport && dataToExport.length > 0) {
+              try {
+                if (mode === "separate") {
+                  console.log(`💾 [BatchScan] Exporting data before cancel: ${dataToExport.length} records`)
+                  setCurrentFile(`กำลังดาวน์โหลดไฟล์ (ข้อมูลที่มีอยู่): ${fileState.originalName}...`)
+                  setProgress(95)
+                  setProgressMessage("กำลังดาวน์โหลดไฟล์...")
+                  await exportSingleFile(fileState.originalName, dataToExport, "vision")
+                  setPreviewData(null)
+                  hasExported = true
+                } else {
+                  // For combine mode, add to combined data
+                  fileData.push({
+                    filename: fileState.originalName,
+                    data: dataToExport,
+                  })
+                  combinedData.push(...dataToExport)
+                  hasExported = true
+                }
+              } catch (exportError) {
+                console.error(`❌ [BatchScan] Failed to export data before cancel:`, exportError)
+              }
+            } else {
+              console.log(`ℹ️ [BatchScan] No data to export (0 records found)`)
+            }
+            
+            // Calculate and refund remaining credits
+            // Credits were deducted for all pages, so refund pages that were not processed
+            try {
+              const pagesToScan = fileState.pagesToScan || Array.from({ length: fileState.totalPages }, (_, i) => i + 1)
+              const totalPages = pagesToScan.length
+              // Count processed pages from visionRecords or receivedPages
+              let processedPages = 0
+              if (fileState.visionRecords && typeof fileState.visionRecords === 'object') {
+                if (Array.isArray(fileState.visionRecords)) {
+                  processedPages = fileState.visionRecords.length
+                } else {
+                  processedPages = Object.keys(fileState.visionRecords).length
+                }
+              } else if (fileState.receivedPages) {
+                processedPages = fileState.receivedPages.size
+              }
+              const remainingPages = totalPages - processedPages
+              
+              if (remainingPages > 0) {
+                const user = auth.currentUser
+                if (user) {
+                  console.log(`💰 [BatchScan] Refunding remaining credits: ${remainingPages} pages (${processedPages}/${totalPages} processed)`)
+                  const refundResult = await refundCreditsToFirebase(user.uid, remainingPages)
+                  console.log(`✅ [BatchScan] Credits refunded: ${refundResult.previousCredits} -> ${refundResult.newCredits} (${refundResult.refunded} pages)`)
+                  
+                  if (onCreditUpdate) {
+                    onCreditUpdate(-refundResult.refunded, refundResult.newCredits)
+                  }
+                }
+              } else {
+                console.log(`ℹ️ [BatchScan] No remaining credits to refund (${processedPages}/${totalPages} pages processed)`)
+              }
+            } catch (refundError) {
+              console.error(`❌ [BatchScan] Failed to refund remaining credits:`, refundError)
+            }
+            
+            // Show warning message
+            setError(`การสแกนถูกยกเลิก - ${hasExported ? 'ได้ export ข้อมูลที่มีอยู่แล้ว' : 'ไม่มีข้อมูลให้ export'} - เครดิตหน้าที่เหลือได้คืนแล้ว`)
             setCurrentFile(`ยกเลิกการสแกน - ไฟล์ ${fileState.originalName} เสร็จแล้ว`)
             setCancelRequested(true) // Update state for UI
-            // Stop scanning, but remaining files (not scanned) are still in the list
+            setStatus("idle")
+            setIsScanning(false)
+            scanStartTimeRef.current = null // Stop timer
+            setElapsedTime(0) // Reset timer
+            stopProgressListener() // Stop progress listener
+            // Stop scanning, but remaining files (not scanned) are still in the list (don't remove them)
             break
           }
         } catch (fileError) {
           console.error(`❌ [BatchScan] Error processing file ${fileState.originalName}:`, fileError)
           fileState.status = "error"
           fileState.error = fileError.message
+          
+          // Try to export existing data if available (before checking credit error)
+          let hasExported = false
+          if (previewData && previewData.allRecords && previewData.allRecords.length > 0) {
+            console.log(`⚠️ [BatchScan] Error occurred but found preview data, attempting to export...`)
+            try {
+              if (mode === "separate") {
+                console.log(`💾 [BatchScan] Exporting partial data: ${previewData.allRecords.length} records`)
+                setCurrentFile(`กำลังดาวน์โหลดไฟล์ (ข้อมูลบางส่วน): ${fileState.originalName}...`)
+                setProgress(95)
+                setProgressMessage("กำลังดาวน์โหลดไฟล์...")
+                await exportSingleFile(fileState.originalName, previewData.allRecords, "vision")
+                setPreviewData(null)
+                hasExported = true
+                console.log(`✅ [BatchScan] Exported partial data successfully`)
+              } else {
+                // For combine mode, add to combined data
+                fileData.push({
+                  filename: fileState.originalName,
+                  data: previewData.allRecords,
+                })
+                combinedData.push(...previewData.allRecords)
+                hasExported = true
+                console.log(`✅ [BatchScan] Added partial data to combined export`)
+              }
+            } catch (exportError) {
+              console.error(`❌ [BatchScan] Failed to export partial data:`, exportError)
+            }
+          } else if (fileState.visionRecords && Object.keys(fileState.visionRecords).length > 0) {
+            console.log(`⚠️ [BatchScan] Error occurred but found visionRecords, attempting to export...`)
+            try {
+              // Convert visionRecords object to flat array
+              let allVisionRecords = []
+              if (typeof fileState.visionRecords === 'object' && !Array.isArray(fileState.visionRecords)) {
+                const sortedPageNumbers = Object.keys(fileState.visionRecords)
+                  .map(Number)
+                  .sort((a, b) => a - b)
+                for (const pageNum of sortedPageNumbers) {
+                  const pageRecords = fileState.visionRecords[pageNum]
+                  if (Array.isArray(pageRecords)) {
+                    allVisionRecords.push(...pageRecords)
+                  }
+                }
+              } else if (Array.isArray(fileState.visionRecords)) {
+                allVisionRecords = fileState.visionRecords
+              }
+              
+              if (allVisionRecords.length > 0) {
+                if (mode === "separate") {
+                  console.log(`💾 [BatchScan] Exporting partial data: ${allVisionRecords.length} records`)
+                  setCurrentFile(`กำลังดาวน์โหลดไฟล์ (ข้อมูลบางส่วน): ${fileState.originalName}...`)
+                  setProgress(95)
+                  setProgressMessage("กำลังดาวน์โหลดไฟล์...")
+                  await exportSingleFile(fileState.originalName, allVisionRecords, "vision")
+                  setPreviewData(null)
+                  hasExported = true
+                  console.log(`✅ [BatchScan] Exported partial data successfully`)
+                } else {
+                  // For combine mode, add to combined data
+                  fileData.push({
+                    filename: fileState.originalName,
+                    data: allVisionRecords,
+                  })
+                  combinedData.push(...allVisionRecords)
+                  hasExported = true
+                  console.log(`✅ [BatchScan] Added partial data to combined export`)
+                }
+              }
+            } catch (exportError) {
+              console.error(`❌ [BatchScan] Failed to export partial data:`, exportError)
+            }
+          }
+          
+          if (hasExported) {
+            setError(`เกิดข้อผิดพลาดสำหรับ ${fileState.originalName} แต่ได้ export ข้อมูลบางส่วนแล้ว: ${fileError.message}`)
+            setProgress(100)
+            setProgressMessage("export ข้อมูลบางส่วนเสร็จสิ้น")
+          }
           
           // Check if this is a credit deduction error
           const isCreditError = fileError.isCreditError || fileError.name === 'CreditDeductionError' || fileError.message?.includes('หักเครดิต')
@@ -1235,12 +1776,45 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
               }
             }
           } else {
+            // For scanning errors, refund credits if error occurred after deduction (but not if user cancelled)
+            if (!cancelRequestedRef.current) {
+              try {
+                // Calculate pages that were deducted for this file
+                const pagesToScan = fileState.pagesToScan || Array.from({ length: fileState.totalPages }, (_, i) => i + 1)
+                const pagesToDeduct = pagesToScan.length
+                
+                const user = auth.currentUser
+                if (user && pagesToDeduct > 0) {
+                  console.log(`💰 [BatchScan] Refunding credits for ${fileState.originalName}: ${pagesToDeduct} pages`)
+                  const refundResult = await refundCreditsToFirebase(user.uid, pagesToDeduct)
+                  console.log(`✅ [BatchScan] Credits refunded successfully: ${refundResult.previousCredits} -> ${refundResult.newCredits} (${refundResult.refunded} pages)`)
+                  
+                  // Update credits in parent component
+                  if (onCreditUpdate) {
+                    onCreditUpdate(-refundResult.refunded, refundResult.newCredits) // Negative to indicate refund
+                  }
+                }
+              } catch (refundError) {
+                console.error(`❌ [BatchScan] Failed to refund credits:`, refundError)
+                // Don't throw - we've already logged the error
+              }
+            } else {
+              console.log(`⚠️ [BatchScan] User cancelled - not refunding credits for ${fileState.originalName}`)
+            }
+            
             // For scanning errors, remove the file (scanning already started or failed)
-            console.log(`❌ [BatchScan] Scanning error for ${fileState.originalName} - removing file from list`)
-            setError(`เกิดข้อผิดพลาดในการประมวลผล ${fileState.originalName}: ${fileError.message}`)
-            setFiles((prev) => prev.filter((fileItem) => fileItem.file !== fileState.file))
-            // Continue with next file
-            continue
+            // But if cancelled, don't remove remaining files
+            if (!cancelRequestedRef.current) {
+              console.log(`❌ [BatchScan] Scanning error for ${fileState.originalName} - removing file from list`)
+              setError(`เกิดข้อผิดพลาดในการประมวลผล ${fileState.originalName}: ${fileError.message}`)
+              setFiles((prev) => prev.filter((fileItem) => fileItem.file !== fileState.file))
+              // Continue with next file
+              continue
+            } else {
+              console.log(`⚠️ [BatchScan] Scanning error for ${fileState.originalName} but cancelled - stopping scan`)
+              // Stop scanning if cancelled
+              break
+            }
           }
         }
       }
@@ -1284,7 +1858,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
           setCurrentFile("")
         setCancelRequested(false) // Reset state after timeout
         setElapsedTime(0) // Reset timer
-        stopStatusPolling() // Stop polling status
+        stopProgressListener() // Stop progress listener
         // Don't clear files - keep remaining files for user to scan again
         // Only clear scan queue and progress
         setScanQueue([])
@@ -1294,10 +1868,12 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
         }, 2000)
       } else {
         setStatus("success")
+        // Clear preview after all files are exported
+        setPreviewData(null)
         setProgress(100)
         setIsScanning(false) // Mark scanning as complete
         scanStartTimeRef.current = null // Stop timer
-        stopStatusPolling() // Stop polling status
+        stopProgressListener() // Stop progress listener
         
         setTimeout(() => {
           setStatus("idle")
@@ -1327,18 +1903,18 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
   }
 
   const handleRun = async () => {
-    if (!creditEnough || files.length === 0) return
+    if (!creditEnough || safeFiles.length === 0) return
 
     const user = auth.currentUser
     if (!user) return
 
     // Calculate pages to scan for each file
     // For now, only support page range for single PDF file
-    const queue = files.map((fileItem, index) => {
+    const queue = safeFiles.map((fileItem, index) => {
       let pagesToScan = null // null = all pages
       
       // Only apply page range to single PDF file
-      if (files.length === 1 && isPdfFile(fileItem.file)) {
+      if (safeFiles.length === 1 && isPdfFile(fileItem.file)) {
         try {
           console.log(`🔍 [Scan] Calculating pages to scan for ${fileItem.originalName}:`)
           console.log(`   - pageRange: "${pageRange}" (type: ${typeof pageRange})`)
@@ -1461,7 +2037,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                   <Box sx={{ p: 2 }}>
                     <Stack spacing={2}>
                       {/* Page Range Selection (only for single PDF file) */}
-                      {files.length === 1 && files.some(f => isPdfFile(f.file)) && (
+                      {safeFiles.length === 1 && safeFiles.some(f => isPdfFile(f.file)) && (
                         <Box>
                           <TextField
                             fullWidth
@@ -1533,12 +2109,12 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                     borderTopRightRadius: 8,
                   }}>
                     <Typography variant="h6" fontWeight={600} sx={{ color: "#ffffff", fontSize: "1.1rem" }}>
-                      อัปโหลดไฟล์ ({files.length})
+                      อัปโหลดไฟล์ ({safeFiles.length})
                     </Typography>
                   </Box>
                   
                   {/* Drop Zone */}
-                  {files.length === 0 ? (
+                  {safeFiles.length === 0 ? (
                     <Box 
                       sx={{ 
                         textAlign: "center", 
@@ -1634,7 +2210,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                         maxHeight: 400,
                         p: 0.5,
                       }}>
-                        {files.map((f, i) => {
+                        {safeFiles.map((f, i) => {
                           const isPdf = isPdfFile(f.file)
                           return (
                             <Box
@@ -1751,7 +2327,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
               </Card>
 
               {/* Credit Warning */}
-              {files.length > 0 && !creditEnough && (
+              {safeFiles.length > 0 && !creditEnough && (
                 <Alert 
                   severity="warning"
                   sx={{ 
@@ -1771,7 +2347,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
           <Grid size={{ xs: 12, lg: 4 }}>
             <Stack spacing={2} sx={{ position: "sticky", top: 20 }}>
               {/* Action Card - แสดงเฉพาะเมื่อมีไฟล์ */}
-              {files.length > 0 && (
+              {safeFiles.length > 0 && (
                 <Card sx={{ boxShadow: "0 4px 12px rgba(0,0,0,0.08)", borderRadius: 2 }}>
                   <CardContent sx={{ p: 0 }}>
                     <Box sx={{ 
@@ -1791,31 +2367,12 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
                             {currentFile ? `กำลังสแกนไฟล์: ${currentFile}` : "กำลังเริ่มต้น..."}
                           </Typography>
-                          {batchProgress.total > 0 && (
-                            <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                              หน้า {batchProgress.current} / {batchProgress.total} หน้า ({Math.round((batchProgress.current / batchProgress.total) * 100)}%)
-                            </Typography>
-                          )}
                           {currentBatch.start > 0 && currentBatch.end > 0 && batchProgress.current < batchProgress.total && (
                             <Typography variant="body2" color="text.secondary" sx={{ mb: 1, fontSize: "0.75rem", fontStyle: "italic" }}>
                               กำลังประมวลผล: หน้า {currentBatch.start}–{currentBatch.end}
                             </Typography>
                           )}
                           {/* Display scan status from Firestore */}
-                          {scanStatus && scanStatus.message && (
-                            <Typography 
-                              variant="body2" 
-                              sx={{ 
-                                mb: 1, 
-                                fontSize: "0.875rem",
-                                color: scanStatus.status === "error" ? "#ef4444" : "#3b82f6",
-                                fontWeight: 500,
-                                fontStyle: "italic"
-                              }}
-                            >
-                              📍 {scanStatus.message}
-                            </Typography>
-                          )}
                           <LinearProgress 
                             variant="determinate" 
                             value={progress} 
@@ -1851,6 +2408,68 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                               {progressMessage}
                             </Typography>
                           )}
+                        </Box>
+                      )}
+
+                      {/* Preview Data */}
+                      {previewData && previewData.allRecords && previewData.allRecords.length > 0 && status === "running" && (
+                        <Box sx={{ mb: 2, mt: 2 }}>
+                          <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 600, color: "#334155" }}>
+                            📋 ตัวอย่างข้อมูลที่ประมวลผลได้ ({previewData.allRecords.length} รายการ)
+                          </Typography>
+                          <Box
+                            sx={{
+                              border: "1px solid #e2e8f0",
+                              borderRadius: 1,
+                              overflowX: "auto",
+                              maxHeight: "300px",
+                              overflowY: "auto",
+                            }}
+                          >
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.75rem" }}>
+                              <thead>
+                                <tr style={{ backgroundColor: "#f8fafc", position: "sticky", top: 0 }}>
+                                  <th style={{ padding: "8px", textAlign: "left", borderBottom: "1px solid #e2e8f0", fontWeight: 600 }}>หน้า</th>
+                                  <th style={{ padding: "8px", textAlign: "left", borderBottom: "1px solid #e2e8f0", fontWeight: 600 }}>ชื่อ-สกุล</th>
+                                  <th style={{ padding: "8px", textAlign: "left", borderBottom: "1px solid #e2e8f0", fontWeight: 600 }}>บ้านเลขที่</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(() => {
+                                  // Flatten records with page numbers
+                                  const recordsWithPages = []
+                                  previewData.pageResults.forEach(pageResult => {
+                                    if (pageResult.records && Array.isArray(pageResult.records)) {
+                                      pageResult.records.forEach(record => {
+                                        recordsWithPages.push({
+                                          page: pageResult.page,
+                                          record: record,
+                                        })
+                                      })
+                                    }
+                                  })
+                                  
+                                  return recordsWithPages.map((item, index) => {
+                                    const nameLabel = "ชื่อ-สกุล"
+                                    const addressLabel = "บ้านเลขที่"
+                                    const name = item.record[nameLabel] || item.record.name || ""
+                                    const address = item.record[addressLabel] || item.record.houseNumber || ""
+                                    
+                                    return (
+                                      <tr key={index} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                                        <td style={{ padding: "6px 8px", color: "#64748b" }}>{item.page}</td>
+                                        <td style={{ padding: "6px 8px" }}>{name || "-"}</td>
+                                        <td style={{ padding: "6px 8px", color: "#64748b" }}>{address || "-"}</td>
+                                      </tr>
+                                    )
+                                  })
+                                })()}
+                              </tbody>
+                            </table>
+                          </Box>
+                          <Typography variant="caption" sx={{ display: "block", mt: 0.5, color: "#64748b", fontStyle: "italic" }}>
+                            หน้า {previewData.currentPage}/{previewData.totalPages} ({previewData.pageResults.length} หน้าสำเร็จ)
+                          </Typography>
                         </Box>
                       )}
 
@@ -1921,7 +2540,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                               fontWeight: 600,
                             }}
                           >
-                            ยกเลิกการสแกน
+                            {cancelRequested ? "กรุณารอสักครู่ กำลังยกเลิก" : "ยกเลิกการสแกน"}
                           </Button>
                         )}
                       </Stack>
@@ -2020,14 +2639,14 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 />
                 <Box>
                   <Typography variant="body1" fontWeight={600} sx={{ mb: 1, color: "#1e293b" }}>
-                    ต้องสแกนไฟล์นี้ให้เสร็จก่อน ถึงจะยกเลิกได้
+                    ยกเลิกการสแกน
                   </Typography>
                   <Typography variant="body2" sx={{ color: "#64748b", lineHeight: 1.7, mb: 1 }}>
-                    ระบบจะสแกนไฟล์ปัจจุบันให้เสร็จก่อน แล้วจึงจะหยุดการสแกน
+                    ระบบจะรอให้หน้าปัจจุบันเสร็จก่อน แล้วจึงจะหยุดการสแกน ข้อมูลที่ได้จะถูก export และเครดิตหน้าที่ยังไม่ได้สแกนจะถูกคืนให้อัตโนมัติ
                   </Typography>
-                  <Alert severity="warning" sx={{ mt: 1, fontSize: "0.875rem" }}>
+                  <Alert severity="info" sx={{ mt: 1, fontSize: "0.875rem" }}>
                     <Typography variant="body2" sx={{ fontSize: "0.875rem" }}>
-                      การปิดหน้าจออาจเสียเครดิตไปโดยไม่ได้ไฟล์ Excel
+                      ไฟล์ที่เลือกไว้จะไม่ถูกลบ สามารถสแกนใหม่ได้ทันที
                     </Typography>
                   </Alert>
                 </Box>
