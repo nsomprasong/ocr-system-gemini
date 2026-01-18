@@ -193,6 +193,19 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
   const [currentSessionId, setCurrentSessionId] = useState(null) // Current scan session ID
   const progressListenerRef = useRef(null) // Ref for Firestore real-time listener unsubscribe function
   const [previewData, setPreviewData] = useState(null) // Preview data from Firestore: { pageResults: [], totalPages: number, currentFile: string }
+  
+  // Refs to access latest state in async functions
+  const scanQueueRef = useRef([]) // Ref to track scanQueue state
+  const safeFilesRef = useRef([]) // Ref to track safeFiles state
+  
+  // Update refs when state changes (must be after state and ref declarations)
+  useEffect(() => {
+    safeFilesRef.current = safeFiles
+  }, [safeFiles])
+  
+  useEffect(() => {
+    scanQueueRef.current = scanQueue
+  }, [scanQueue])
 
   const handleSelect = async (fileList) => {
     try {
@@ -249,18 +262,35 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
       setLoadingFiles(new Set())
       
       // If scanning is in progress, add new files to queue
-      if (isScanning && scanQueue.length > 0) {
-        const newFileStates = selected.map(fileItem => ({
-          file: fileItem.file,
-          originalName: fileItem.originalName,
-          totalPages: fileItem.pageCount,
-          receivedPages: new Set(),
-          pageResults: {},
-          status: "pending",
-        }))
+      if (isScanning && scanQueueRef.current.length > 0) {
+        const newFileStates = selected.map(fileItem => {
+          // Calculate pagesToScan for new file (similar to handleRun)
+          let pagesToScan = null // null = all pages
+          
+          // Only apply page range to single PDF file (if only one file in total)
+          const totalFilesAfterAdd = safeFilesRef.current.length + selected.length
+          if (totalFilesAfterAdd === 1 && isPdfFile(fileItem.file)) {
+            try {
+              pagesToScan = calculatePagesToScan(pageRange, startPage, endPage, fileItem.pageCount)
+            } catch (err) {
+              console.warn(`⚠️ [BatchScan] Error calculating pages for new file ${fileItem.originalName}:`, err)
+              pagesToScan = null // Fallback to all pages
+            }
+          }
+          
+          return {
+            file: fileItem.file,
+            originalName: fileItem.originalName,
+            totalPages: fileItem.pageCount,
+            pagesToScan: pagesToScan, // Array of page numbers to scan, or null for all pages
+            receivedPages: new Set(),
+            pageResults: {},
+            status: "pending",
+          }
+        })
         
         setScanQueue((prev) => [...prev, ...newFileStates])
-        console.log(`📎 [BatchScan] Added ${newFileStates.length} new file(s) to queue during scan`)
+        console.log(`📎 [BatchScan] Added ${newFileStates.length} new file(s) to queue during scan:`, newFileStates.map(f => f.originalName))
       }
     } catch (error) {
       console.error("❌ Error in handleSelect:", error)
@@ -377,7 +407,8 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
             }
             
             // Update preview data if pageResults are available
-            if (progressData.pageResults && Array.isArray(progressData.pageResults)) {
+            // Only update if this progress update is for the current session
+            if (progressData.sessionId === sessionId && progressData.pageResults && Array.isArray(progressData.pageResults)) {
               // Flatten all records from all pages for preview
               const allRecords = []
               progressData.pageResults.forEach(pageResult => {
@@ -392,9 +423,17 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                 totalPages: progressData.totalPages || 0,
                 currentPage: progressData.currentPage || 0,
                 fileName: currentFile || "กำลังประมวลผล...",
+                sessionId: sessionId, // Store sessionId to verify it matches
               })
               
-              console.log(`📋 [Preview] Updated preview: ${allRecords.length} records from ${progressData.pageResults.length} pages`)
+              console.log(`📋 [Preview] Updated preview for session ${sessionId}: ${allRecords.length} records from ${progressData.pageResults.length} pages`, {
+                sessionId: sessionId,
+                fileName: currentFile,
+                recordCount: allRecords.length,
+                pageCount: progressData.pageResults.length
+              })
+            } else if (progressData.sessionId && progressData.sessionId !== sessionId) {
+              console.warn(`⚠️ [Preview] Ignoring progress update from different session: ${progressData.sessionId} (current: ${sessionId})`)
             }
             
             // Stop listener if completed or error
@@ -505,9 +544,11 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
       
       console.log(`📄 [Scan] Processing all pages: ${startPage}-${endPage} (${pagesToScan.length} pages)`)
       
-      // Generate session ID
+      // Generate session ID (unique for this file)
       const sessionId = generateSessionId()
       setCurrentSessionId(sessionId)
+      
+      console.log(`🆔 [Scan] Generated sessionId for ${fileState.originalName}: ${sessionId}`)
       
       // Show initial progress
       setProgress(0)
@@ -516,7 +557,10 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
       // Get device ID for device isolation
       const deviceId = getDeviceId()
       
-      // Start real-time progress listener
+      // Stop any existing listener first (should already be stopped, but ensure it)
+      stopProgressListener()
+      
+      // Start real-time progress listener for this file's session
       startProgressListener(sessionId, deviceId)
       
       // Create AbortController for this scan
@@ -606,9 +650,17 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
               fileState.visionRecords = {}
             }
             fileState.visionRecords[pageResult.pageNumber] = pageResult.records
-            console.log(`💾 [Scan] Stored ${pageResult.records.length} Vision records for page ${pageResult.pageNumber}`)
+            console.log(`💾 [Scan] Stored ${pageResult.records.length} Vision records for page ${pageResult.pageNumber} of file ${fileState.originalName}`, {
+              fileName: fileState.originalName,
+              pageNumber: pageResult.pageNumber,
+              recordCount: pageResult.records.length,
+              sessionId: sessionId
+            })
           } else {
-            console.warn(`⚠️ [Scan] Page ${pageResult.pageNumber} has no records (records: ${pageResult.records ? 'exists but not array' : 'missing'})`)
+            console.warn(`⚠️ [Scan] Page ${pageResult.pageNumber} has no records (records: ${pageResult.records ? 'exists but not array' : 'missing'})`, {
+              fileName: fileState.originalName,
+              pageNumber: pageResult.pageNumber
+            })
           }
           
           console.log(`✅ [Scan] Page ${pageResult.pageNumber} stored`)
@@ -942,13 +994,15 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
 
   /**
    * Run scan queue - process all files with batch scanning
-   * @param {Array} queue - Array of ScanFileState objects
+   * Uses scanQueueRef to access latest queue state (allows adding/removing files during scan)
+   * @param {Array} initialQueue - Initial array of ScanFileState objects (for initial setup)
    * @param {number} initialCredits - Initial user credits
    * @param {Function} onCreditUpdate - Callback to update credits
    */
-  const runScanQueue = async (queue, initialCredits, onCreditUpdate) => {
-    if (!queue || queue.length === 0) {
-      console.warn(`⚠️ [BatchScan] Scan queue is empty`)
+  const runScanQueue = async (initialQueue, initialCredits, onCreditUpdate) => {
+    // Initialize queue from parameter, but will use ref for subsequent iterations
+    if (!initialQueue || initialQueue.length === 0) {
+      console.warn(`⚠️ [BatchScan] Initial scan queue is empty`)
       return
     }
     
@@ -956,8 +1010,9 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
     setCancelRequested(false)
     cancelRequestedRef.current = false
     
-    // Update state for UI
-    setScanQueue(queue)
+    // Update state for UI (initial queue)
+    setScanQueue(initialQueue)
+    scanQueueRef.current = initialQueue // Update ref
     setStatus("running")
     setIsScanning(true) // Mark scanning as in progress
     setProgress(0)
@@ -972,33 +1027,90 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
     // Track current credits (updated after each file)
     let currentCredits = initialCredits
     
+    // Track processed file indices to avoid reprocessing
+    const processedIndices = new Set()
+    
     try {
-      // Process each file (use queue parameter, not scanQueue state)
+      // Process files in a loop that checks for new files
       let processedCount = 0
-      for (let i = 0; i < queue.length; i++) {
+      let currentIndex = 0
+      
+      // Keep processing until all files in queue are processed
+      while (true) {
         // Check if cancel was requested - if so, stop immediately
         if (cancelRequestedRef.current) {
           console.log(`⚠️ [BatchScan] Cancel requested - stopping immediately`)
-          // Don't process remaining files
           break
         }
         
-        const fileState = queue[i]
+        // Get current queue from ref (may have changed if files were added/removed)
+        const currentQueue = scanQueueRef.current
+        
+        // If we've processed all files in current queue, check for new files
+        if (currentIndex >= currentQueue.length) {
+          // Wait a bit and check again for new files
+          await new Promise(resolve => setTimeout(resolve, 500))
+          const updatedQueue = scanQueueRef.current
+          
+          // If queue hasn't changed, we're done
+          if (updatedQueue.length === currentQueue.length) {
+            console.log(`✅ [BatchScan] All files processed, no new files added`)
+            break
+          }
+          
+          // Queue has new files, continue processing
+          console.log(`📎 [BatchScan] New files detected in queue: ${updatedQueue.length - currentQueue.length} new file(s)`)
+          continue
+        }
+        
+        const fileState = currentQueue[currentIndex]
+        
+        // Skip if already processed
+        if (processedIndices.has(currentIndex)) {
+          currentIndex++
+          continue
+        }
         
         // Skip if file was removed from files list
-        const fileStillExists = safeFiles.some(f => f.file === fileState.file)
+        const fileStillExists = safeFilesRef.current.some(f => f.file === fileState.file)
         if (!fileStillExists) {
           console.log(`⏭️ [BatchScan] Skipping removed file: ${fileState.originalName}`)
+          processedIndices.add(currentIndex)
+          currentIndex++
           continue
         }
         
         setCurrentFileIndex(processedCount)
         processedCount++
         
-        console.log(`📄 [BatchScan] Processing file ${processedCount}/${queue.length}: ${fileState.originalName}`)
+        console.log(`📄 [BatchScan] Processing file ${processedCount}/${currentQueue.length}: ${fileState.originalName} (index: ${currentIndex})`)
         
-        // Clear preview for new file
+        // Clear preview and reset state for new file
         setPreviewData(null)
+        setCurrentSessionId(null) // Reset session ID for new file
+        setProgress(0)
+        setProgressMessage("")
+        
+        // Ensure fileState has fresh state for this file
+        // Reset visionRecords and pageResults to prevent data mixing
+        if (!fileState.visionRecords) {
+          fileState.visionRecords = {}
+        } else {
+          // Clear existing visionRecords to prevent mixing with previous file
+          fileState.visionRecords = {}
+        }
+        if (!fileState.pageResults) {
+          fileState.pageResults = {}
+        } else {
+          // Clear existing pageResults to prevent mixing with previous file
+          fileState.pageResults = {}
+        }
+        if (!fileState.receivedPages) {
+          fileState.receivedPages = new Set()
+        } else {
+          // Clear existing receivedPages to prevent mixing with previous file
+          fileState.receivedPages.clear()
+        }
         
         try {
           // Calculate pages to scan for this file
@@ -1009,7 +1121,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
           // We don't check here because credits might have changed from other devices
           
           // Scan file (credits will be deducted inside scanSingleFile by fetching from Firebase first)
-          await scanSingleFile(fileState, queue, currentCredits, (deducted, newCreditsFromFirebase) => {
+          await scanSingleFile(fileState, currentQueue, currentCredits, (deducted, newCreditsFromFirebase) => {
             // Update current credits with actual value from Firebase
             if (newCreditsFromFirebase !== undefined) {
               currentCredits = newCreditsFromFirebase
@@ -1072,6 +1184,8 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
               console.warn(`⚠️ [BatchScan] File ${fileState.originalName} incomplete: ${fileState.receivedPages.size}/${expectedPages} pages`)
             }
             // Don't process incomplete files
+            processedIndices.add(currentIndex)
+            currentIndex++
             continue
           }
           
@@ -1272,7 +1386,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
                   if (mode === "separate") {
                     console.log(`💾 [BatchScan] Exporting file immediately: ${fileState.originalName}`)
                     setCurrentFile(`กำลังดาวน์โหลดไฟล์: ${fileState.originalName}...`)
-                    setProgress(Math.min(90, 10 + (processedCount / queue.length) * 80))
+                    setProgress(Math.min(90, 10 + (processedCount / currentQueue.length) * 80))
                     
                     // Export single file immediately and wait for download to complete
                     // Pass raw records, not mapped rows
@@ -1461,7 +1575,7 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
               if (mode === "separate") {
                 console.log(`💾 [BatchScan] Exporting file immediately: ${fileState.originalName}`)
                 setCurrentFile(`กำลังดาวน์โหลดไฟล์: ${fileState.originalName}...`)
-                setProgress(Math.min(90, 10 + (processedCount / queue.length) * 80))
+                setProgress(Math.min(90, 10 + (processedCount / currentQueue.length) * 80))
                 
                 // Export single file immediately and wait for download to complete
                 await exportSingleFile(fileState.originalName, data)
@@ -1481,6 +1595,10 @@ export default function Scan({ credits, files, setFiles, onNext, columnConfig, o
               }
             }
           }
+          
+          // Mark this file as processed and move to next
+          processedIndices.add(currentIndex)
+          currentIndex++
           
           // Check if cancel was requested after finishing current file
           // If cancelled, export existing data, refund remaining credits, and stop
