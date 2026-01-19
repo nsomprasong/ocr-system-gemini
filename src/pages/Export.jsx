@@ -21,11 +21,13 @@ import {
 } from "@mui/material"
 import PlayArrowIcon from "@mui/icons-material/PlayArrow"
 import CloseIcon from "@mui/icons-material/Close"
-import { smartOcrPdf } from "../services/smartOcr.service"
+import { smartOcrVisionPdf } from "../services/smartOcr.service"
 import {
   createSeparateExcelFiles,
   createCombinedExcelFile,
+  createExcelFile,
 } from "../services/excel.service"
+import DownloadIcon from "@mui/icons-material/Download"
 import {
   saveExcelToServer,
   saveWordToServer,
@@ -131,18 +133,13 @@ export default function Export({
           }
 
           try {
-            // Convert columnConfig to columnDefinitions format
-            const columnDefinitions = columnConfig.map((col) => ({
-              columnKey: col.key,
-              label: col.label || col.key,
-            }))
-
+            // Use smartOcrVisionPdf (Vision mode only)
             const smartOcrResult = await Promise.race([
-              smartOcrPdf(fileItem.file, columnDefinitions),
+              smartOcrVisionPdf(fileItem.file, { scanMode: "direct" }),
               new Promise((_, reject) =>
                 setTimeout(
-                  () => reject(new Error("Smart OCR timeout: เกิน 5 นาที")),
-                  5 * 60 * 1000
+                  () => reject(new Error("Smart OCR Vision timeout: เกิน 15 นาที")),
+                  15 * 60 * 1000 // 15 minutes (900 seconds) to match backend timeout
                 )
               ),
             ])
@@ -353,12 +350,52 @@ export default function Export({
           {ocrResults.length > 0 && (
             <Card variant="outlined">
               <CardContent>
-                <Typography variant="body2" fontWeight={500} gutterBottom>
-                  Smart OCR Preview (1 แถว = 1 record)
-                </Typography>
-                <Typography variant="caption" color="text.secondary" gutterBottom>
-                  แสดงตัวอย่างข้อมูลตาม records ที่ได้จาก Smart OCR (ช่องว่างจะถูกไฮไลต์)
-                </Typography>
+                <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", mb: 1 }}>
+                  <Box>
+                    <Typography variant="body2" fontWeight={500} gutterBottom>
+                      Smart OCR Preview (1 แถว = 1 record)
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" gutterBottom>
+                      แสดงตัวอย่างข้อมูลตาม records ที่ได้จาก Smart OCR (ช่องว่างจะถูกไฮไลต์)
+                    </Typography>
+                  </Box>
+                  <Button
+                    variant="outlined"
+                    size="small"
+                    startIcon={<DownloadIcon />}
+                    onClick={() => {
+                      // Export all records from all files
+                      const allRecords = []
+                      scanFiles.forEach((fileItem, index) => {
+                        const smartOcrResult = ocrResults[index]
+                        if (smartOcrResult && smartOcrResult.records) {
+                          allRecords.push(...smartOcrResult.records)
+                        }
+                      })
+                      
+                      if (allRecords.length === 0) {
+                        setError("ไม่มีข้อมูลที่จะส่งออก")
+                        return
+                      }
+                      
+                      // Generate filename: OCR_<originalFileName>_<timestamp>.xlsx
+                      const firstFileName = scanFiles[0]?.originalName || "document"
+                      const baseName = firstFileName.replace(/\.[^/.]+$/, "")
+                      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5)
+                      const filename = `OCR_${baseName}_${timestamp}.xlsx`
+                      
+                      try {
+                        createExcelFile(allRecords, columnConfig, filename)
+                        console.log(`✅ [Export] Exported ${allRecords.length} records to ${filename}`)
+                      } catch (exportError) {
+                        console.error("❌ [Export] Error:", exportError)
+                        setError(`เกิดข้อผิดพลาดในการส่งออก: ${exportError.message}`)
+                      }
+                    }}
+                  >
+                    Export Excel
+                  </Button>
+                </Box>
                 <Stack spacing={2} sx={{ mt: 1 }}>
                   {scanFiles.map((fileItem, index) => {
                     const smartOcrResult = ocrResults[index]

@@ -7,7 +7,13 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:smart-ocr": "node test/smart-ocr.integration.test.js",
+    "test:smart-ocr:data": "node test/smart-ocr.data-integrity.test.js",
+    "test:smart-ocr:count": "node test/smart-ocr.count-preservation.test.js",
+    "test:smart-ocr:mapping": "node test/smart-ocr.name-house-mapping.test.js",
+    "test:smart-ocr:rows": "node test/smart-ocr.row-separation.test.js",
+    "test:smart-ocr:all": "node test/run-all-smart-ocr-tests.js"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

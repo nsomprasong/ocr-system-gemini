@@ -1,14 +1,14 @@
-// OCR Service Gemini - Calls ocrImageGemini Cloud Function with Normalization Pipeline
-// This is a NEW service file - uses Gemini pipeline instead of V2
-// Uses the new normalization pipeline: PDF → Image → Normalize (detect orientation + rotate) → OCR
+// OCR Service Gemini - Calls smartOcrVisionPdf Cloud Function with OCR mode
+// This service now uses smartOcrVisionPdf with scanMode: "ocr" or "perPage"
+// Uses the normalization pipeline: PDF → Image → Normalize (detect orientation + rotate) → OCR
 
 // Get URL from environment or use default
-// Deployed function URL format: https://us-central1-{PROJECT_ID}.cloudfunctions.net/ocrImageGemini
+// Deployed function URL format: https://us-central1-{PROJECT_ID}.cloudfunctions.net/smartOcrVisionPdf
 // Priority: VITE_FIREBASE_OCR_GEMINI_URL > default URL
 // Project: ocr-system-c3bea
 const FIREBASE_OCR_GEMINI_URL = 
   import.meta.env.VITE_FIREBASE_OCR_GEMINI_URL || 
-  "https://us-central1-ocr-system-c3bea.cloudfunctions.net/ocrImageGemini"
+  "https://us-central1-ocr-system-c3bea.cloudfunctions.net/smartOcrVisionPdf"
 
 /**
  * Converts file to base64
@@ -39,7 +39,13 @@ export async function ocrImageGemini(imageFile: File, rotation?: number) {
     const imageBase64 = await fileToBase64(imageFile)
     console.log(`✅ [OCR Gemini] Image converted, base64 length: ${imageBase64.length}`)
 
-    console.log(`🌐 [OCR Gemini] Calling OCR Gemini API...`)
+    // Detect mime type from file extension
+    const fileName = imageFile.name.toLowerCase()
+    const mimeType = fileName.endsWith('.png') ? 'image/png' : 
+                     (fileName.endsWith('.jpg') || fileName.endsWith('.jpeg') ? 'image/jpeg' : 
+                      'image/png')
+
+    console.log(`🌐 [OCR Gemini] Calling smartOcrVisionPdf with OCR mode...`)
     const response = await fetch(FIREBASE_OCR_GEMINI_URL, {
       method: "POST",
       headers: {
@@ -47,7 +53,10 @@ export async function ocrImageGemini(imageFile: File, rotation?: number) {
       },
       body: JSON.stringify({
         image_base64: imageBase64,
+        pdf_base64: null, // No PDF for image
         fileName: imageFile.name,
+        mimeType: mimeType,
+        scanMode: "ocr", // Use OCR mode for image processing
         ...(rotation !== undefined && rotation !== null ? { rotation } : {}), // Include rotation if provided
       }),
     })
@@ -90,13 +99,14 @@ export async function ocrImageGemini(imageFile: File, rotation?: number) {
     console.log(`📄 [OCR Gemini] Response:`, {
       success: data.success,
       wordsCount: data.result?.words?.length || 0,
+      scanMode: data.scanMode,
     })
 
     if (!data.success) {
       throw new Error(data.error || "OCR Gemini failed")
     }
 
-    // Return OCRResult
+    // Return OCRResult (from smartOcrVisionPdf OCR mode)
     return data.result
   } catch (error) {
     console.error("❌ [OCR Gemini] Error:", error)
@@ -119,10 +129,14 @@ export async function ocrPdfGemini(pdfFile: File, rotation?: number, scanMode: b
     const pdfBase64 = await fileToBase64(pdfFile)
     console.log(`✅ [OCR Gemini] PDF converted, base64 length: ${pdfBase64.length}`)
 
+    // Determine scanMode for smartOcrVisionPdf
+    // "perPage" → "perPage", true → "ocr", false → "ocr" (template mode)
+    const normalizedScanMode = scanMode === "perPage" ? "perPage" : (scanMode ? "ocr" : "ocr");
+    
     const requestBody: any = {
       pdf_base64: pdfBase64,
       fileName: pdfFile.name,
-      scanMode: scanMode, // Send scanMode to Firebase (boolean or string "perPage")
+      scanMode: normalizedScanMode, // Send scanMode to smartOcrVisionPdf: "ocr" or "perPage"
     }
     
     // Include rotation if provided (manual rotation from user)
